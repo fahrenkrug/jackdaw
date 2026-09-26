@@ -574,7 +574,7 @@ fn asset_reference_seed(
 
 /// The runtime inline assets referenced by a BSN document's kept components,
 /// collected at emit time so they can be embedded and resolved.
-struct BsnInlineAssetPass {
+pub(crate) struct BsnInlineAssetPass {
     /// Asset id to the reference string emitted for its `Handle<T>` fields:
     /// `#Name` for scene-inline entries and `@Name` for catalog entries.
     names: bevy::platform::collections::HashMap<UntypedAssetId, String>,
@@ -1088,25 +1088,12 @@ fn author(
     let registry = world.resource::<AppTypeRegistry>().clone();
     normalize_derived_button_styles(world, &mut ast, &registry);
 
-    let seed = asset_reference_seed(world);
-
+    // Name the assets handle fields reference before sparsifying: the live
+    // document holds the asset-blind placeholder (`""`) an ECS mirror stored,
+    // and compared against a prefab baseline that names the asset, an unchanged
+    // inherited component would read as an override.
     let entities = doc_entities_in_order(&ast);
-    let pass = {
-        let reg = registry.read();
-        collect_bsn_inline_assets(world, &reg, &entities, seed)
-    };
-
-    // Re-derive each handle-bearing component patch with the asset context so
-    // its handle fields emit reference names or asset paths. This runs before
-    // sparsifying: the live document holds the asset-blind placeholder (`""`)
-    // an ECS mirror stored, and compared against a prefab baseline that names
-    // the asset, an unchanged inherited component would read as an override.
-    if !pass.touched.is_empty() {
-        if !pass.refs.is_empty() {
-            jackdaw_bsn::append_assets_to_ast(&mut ast, world, &pass.refs);
-        }
-        rederive_handle_patches(world, &mut ast, &registry, parent_path, &pass);
-    }
+    let pass = name_handles_in(world, &mut ast, &entities, parent_path);
 
     // Reduce inherited prefab-instance content to sparse override entries
     // (`PrefabEntityId` plus only diverged fields). No-op when there is no
@@ -1150,6 +1137,33 @@ fn emitted(
         SourceSpelling::AsHeld => Vec::new(),
     };
     (jackdaw_bsn::emit_scene(ast), named)
+}
+
+/// Name the assets `entities` reference in `ast`, a document other than the
+/// live one whose nodes are linked to those entities: embed the runtime assets
+/// they use and re-derive their handle-bearing patches with the asset context,
+/// the way a save does, so a `Handle<T>` field names its asset instead of the
+/// placeholder the live document's asset-blind mirror stored.
+pub(crate) fn name_handles_in(
+    world: &World,
+    ast: &mut jackdaw_bsn::SceneBsnAst,
+    entities: &[Entity],
+    parent_path: &Path,
+) -> BsnInlineAssetPass {
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let seed = asset_reference_seed(world);
+    let pass = {
+        let reg = registry.read();
+        collect_bsn_inline_assets(world, &reg, entities, seed)
+    };
+    if pass.touched.is_empty() {
+        return pass;
+    }
+    if !pass.refs.is_empty() {
+        jackdaw_bsn::append_assets_to_ast(ast, world, &pass.refs);
+    }
+    rederive_handle_patches(world, ast, &registry, parent_path, &pass);
+    pass
 }
 
 /// Re-derive every component patch listed in `pass.touched` from its live ECS
