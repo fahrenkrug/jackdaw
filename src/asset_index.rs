@@ -827,6 +827,13 @@ pub fn open_asset_index(world: &mut World) {
     start_asset_walk(world);
 }
 
+/// Whether a walk of the project's assets is still out. Until it lands, the
+/// index does not hold the project's files, so a reference to one (a brush
+/// face's material, say) does not resolve through it.
+pub(crate) fn asset_walk_in_flight(world: &World) -> bool {
+    world.contains_resource::<AssetWalkTask>()
+}
+
 /// Ask for a walk of the project's assets, unless one is already running.
 fn start_asset_walk(world: &mut World) {
     if world.contains_resource::<AssetWalkTask>() {

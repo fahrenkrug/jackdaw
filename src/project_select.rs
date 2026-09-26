@@ -1276,6 +1276,14 @@ struct PendingSceneOpens {
 }
 
 fn open_pending_scenes(world: &mut World) {
+    // A scene resolves the asset files it names (a brush face's material) through
+    // the asset index, which a walk off the main thread is still filling when the
+    // project opens. Opened before the walk lands, those references go to the
+    // asset server, which has no loader for them, and the faces never draw. The
+    // footer names the walk meanwhile.
+    if crate::asset_index::asset_walk_in_flight(world) {
+        return;
+    }
     let Some(next) = world.resource::<PendingSceneOpens>().paths.front().cloned() else {
         finish_pending_scene_opens(world);
         return;
@@ -3268,6 +3276,43 @@ fn poll_new_project_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scenes a project opens with resolve the asset files they name (a brush
+    /// face's material) through the asset index, so they wait for the walk that
+    /// fills it rather than opening while it is still out.
+    #[test]
+    fn queued_scenes_wait_for_the_asset_index_walk() {
+        bevy::tasks::IoTaskPool::get_or_init(bevy::tasks::TaskPool::new);
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let scene = dir.path().join("assets/scene.bsn");
+        std::fs::create_dir_all(scene.parent().expect("an assets folder")).expect("assets");
+        std::fs::write(&scene, "").expect("the scene");
+
+        let mut world = World::new();
+        world.insert_resource(ProjectRoot::new(
+            dir.path().to_path_buf(),
+            project::ProjectConfig::default(),
+        ));
+        world.init_resource::<crate::asset_index::AssetIndex>();
+        crate::asset_index::open_asset_index(&mut world);
+        assert!(
+            crate::asset_index::asset_walk_in_flight(&world),
+            "opening a project sends a walk of its assets out"
+        );
+
+        world.insert_resource(PendingSceneOpens {
+            paths: [scene.clone()].into(),
+            active: 0,
+            named: true,
+            root: dir.path().to_path_buf(),
+        });
+        open_pending_scenes(&mut world);
+        assert_eq!(
+            world.resource::<PendingSceneOpens>().paths.front(),
+            Some(&scene),
+            "the scene stays queued while the walk is out"
+        );
+    }
 
     #[test]
     fn the_new_project_browse_starts_where_the_location_field_points() {
