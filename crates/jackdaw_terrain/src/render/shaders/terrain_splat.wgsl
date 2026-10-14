@@ -14,11 +14,35 @@
 //
 // Every texture read is `textureSampleGrad` with derivatives taken once in
 // uniform control flow at the top of `fragment`: the per-layer branches below
-// make implicit-derivative sampling illegal.
+// make implicit-derivative sampling illegal. The two plain `textureSample`s, the
+// tint and the colour map, sit in that same uniform region.
+//
+// Two bands are set by the distance from the camera, and neither applies to an
+// orthographic view (a shadow cascade has no eye to measure from):
+//
+//   near   within `near_distance`, fading out over the next third: parallax
+//          relief on the dominant texture, a grain read at four times its
+//          tiling, and a wider blend between the planes of a cliff.
+//   far    past `far_distance`, fading in over the next third: the normal,
+//          occlusion and roughness maps are not read at all, and the slot
+//          averages stand in for them. Albedo and height stay in every band, as
+//          the height blend needs them, and so does detiling.
+//
+// Steep ground is projected along the terrain's own X and Z axes as well as from
+// above, so a cliff is not a texture smeared down a slope. The top plane is the
+// planar projection the shader has always used, detiling and all; the two side
+// planes are not detiled.
+//
+// Cost, per fragment: flat ground in the far band reads albedo and height once
+// per texture id and tap, less than before. Flat ground in the mid band reads
+// what it always did. A fragment on a cliff reads a second plane. The relief
+// march is the only loop, and it runs only in the near band, on slots that have
+// a height map of their own, when the relief depth is set.
 
 #import bevy_pbr::{
     forward_io::{VertexOutput, FragmentOutput},
     mesh_bindings::mesh,
+    mesh_functions::{get_local_from_world, get_world_from_local},
     mesh_view_bindings::view,
     pbr_functions,
     pbr_types,
@@ -44,6 +68,38 @@ const MAX_LAYERS: u32 = 16u;
 // What a slot that sets no reflectance shades at: a StandardMaterial's
 // default, 4% at normal incidence.
 const DEFAULT_REFLECTANCE: f32 = 0.5;
+
+// Rec.709 luminance weights. The albedo array is sRGB, so what is sampled from
+// it is already linear and these apply as they stand.
+const LUMA: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
+
+// How steep the ground has to be, as `1 - normal.y`, for the side planes to
+// start and to finish taking over from the top one. 0.30 is about 46 degrees
+// of slope and 0.45 about 57.
+const STEEP_START: f32 = 0.30;
+const STEEP_END: f32 = 0.45;
+// How sharply the two side planes split, as the exponent on the normal's X and
+// Z components. High picks the dominant axis; low blends the corner. Near the
+// camera the corner is blended, far from it the split is hard and cheap.
+const SPLIT_SHARP: f32 = 16.0;
+const SPLIT_SOFT: f32 = 4.0;
+// A plane with less than this share is not sampled at all.
+const PLANE_CUTOFF: f32 = 0.02;
+
+// The grain read is this many times finer than the texture's own tiling.
+const GRAIN_TILING: f32 = 4.0;
+
+// The relief march, after `parallax_field_trace` in crates/parallax of the
+// Hayjump monorepo: a step budget from the grazing angle, then a binary search
+// between the last sample above the surface and the first below it.
+const RELIEF_MIN_STEPS: f32 = 8.0;
+const RELIEF_MAX_STEPS: f32 = 32.0;
+const RELIEF_REFINE_STEPS: u32 = 5u;
+// An open surface has no face to leave through, so a view that skims the ground
+// would march far sideways. The ray is cut to the length that crosses the shell
+// at this steepness (its vertical share), which bounds the shift to four shell
+// depths.
+const RELIEF_MIN_STEEPNESS: f32 = 0.25;
 
 struct SplatUniform {
     // 16 per-id UV scales, packed four to a vec4 for uniform alignment.
@@ -121,6 +177,40 @@ struct SplatUniform {
 @group(#{MATERIAL_BIND_GROUP}) @binding(11) var colour_map: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(12) var colour_map_sampler: sampler;
 
+// Everything about the fragment that every texture id's accumulation shares,
+// worked out once at the top of `fragment`.
+//
+// Private state rather than parameters: the accumulation runs once per id and
+// the struct is read from several places, and nothing in it is an array, so
+// nothing is copied per call.
+struct Frame {
+    // The fragment in terrain-local space, and how it moves across the screen.
+    // The two side planes are projected from this.
+    local: vec3<f32>,
+    local_ddx: vec3<f32>,
+    local_ddy: vec3<f32>,
+    // The top plane's position, planar in X and Z, and how it moves. Taken from
+    // UV0 rather than from `local`, which keeps it bit for bit what it was, and
+    // shifted by the relief.
+    top: vec2<f32>,
+    top_ddx: vec2<f32>,
+    top_ddy: vec2<f32>,
+    // The share of each projection, summing to 1: x is the top plane, y the
+    // plane that faces along X, z the plane that faces along Z.
+    planes: vec3<f32>,
+    // The distance bands, each 0..1. Neither is ever above 0 for an
+    // orthographic view.
+    near: f32,
+    far: f32,
+    // The surface's normal in world space, before any texture has bent it.
+    normal: vec3<f32>,
+    // The colour map under the fragment, linear. White where the terrain has
+    // none.
+    colour: vec3<f32>,
+}
+
+var<private> frame: Frame;
+
 // The last id this material can address: one short of the bound set's
 // layer count, and never past the UV-scale array. Every id is clamped
 // through here exactly once, so the layer sampled and the UV scale
@@ -135,13 +225,25 @@ fn uv_scale_for(id: u32) -> f32 {
 }
 
 // `id` must already be clamped by `last_layer`.
-// A slot's own roughness or reflectance, negative where it sets none.
-fn slot_value(values: array<vec4<f32>, 4>, id: u32) -> f32 {
-    return values[id / 4u][id % 4u];
-}
-
 fn detile_for(id: u32) -> f32 {
     return splat.detile_strengths[id / 4u][id % 4u];
+}
+
+// A slot's own roughness, negative where it sets none. `id` must already be
+// clamped by `last_layer`. Read straight from the uniform: handing the packed
+// array to a function would copy it on every call.
+fn slot_roughness_for(id: u32) -> f32 {
+    return splat.slot_roughness[id / 4u][id % 4u];
+}
+
+// A slot's own reflectance, negative where it sets none. `id` must already be
+// clamped by `last_layer`.
+fn slot_reflectance_for(id: u32) -> f32 {
+    return splat.slot_reflectance[id / 4u][id % 4u];
+}
+
+fn luminance(colour: vec3<f32>) -> f32 {
+    return dot(colour, LUMA);
 }
 
 // Two uncorrelated values in 0..1 from a tile coordinate. Integer-valued
@@ -273,7 +375,10 @@ fn slope_at(corner: vec2<i32>, f: vec2<f32>) -> f32 {
 
 struct Accum {
     albedo: vec3<f32>,
-    normal: vec3<f32>,
+    // The top plane's normals, tangent space, summed by weight.
+    normal_top: vec3<f32>,
+    // The side planes' normals, already in world space, summed by weight.
+    normal_side: vec3<f32>,
     occlusion: f32,
     roughness: f32,
     reflectance: f32,
@@ -282,108 +387,202 @@ struct Accum {
 
 // One texture id's contribution, summed over the corners that named it.
 //
-// `corner_weights` holds the four bilinear corner shares, with zero in the slots
-// that did not name this id at this layer weight. The weight is
+// `corner_weights` holds the four bilinear corner shares, with zero in the
+// corners that did not name this id, and `layer_weights` the weight this id has
+// in each corner's word. The weight is
 //
 //     sum over corners of pow(corner_w + layer_w + height, sharpness) * corner_w
 //
 // which is the height-blend curve. `corner_w` rides inside the power so a near
 // corner gets a height advantage, and multiplies outside it so a far corner
-// cannot win on height alone.
+// cannot win on height alone. A corner that did not name the id has a
+// `corner_w` of zero, so whatever its `layer_w` is changes nothing.
 //
-// Taking the four corners as a vector rather than one call per corner is what
-// makes the uniform-word fast path in `fragment` exact: a zeroed slot contributes
-// `pow(k, s) * 0`, so summing the slots here is identical to summing four
-// separate calls.
+// Taking the four corners as vectors rather than one call per corner is what
+// makes both paths in `fragment` exact: the caller merges corners that name the
+// same id, so each id is sampled once, and the sum above is the same sum the
+// separate per-corner calls made.
+//
+// The id is sampled on every plane that has a share of this fragment and the
+// planes are blended by their shares, so albedo, height, occlusion and
+// roughness are one value per id like they always were. The normals are the
+// exception: the top plane keeps its tangent-space normal, which `fragment`
+// turns by the one frame it has, and each side plane's normal is brought into
+// world axes by a whiteout blend here, because a side plane has no frame.
 fn accumulate(
     accum: Accum,
     id: u32,
     corner_weights: vec4<f32>,
-    layer_weight: f32,
-    local_xz: vec2<f32>,
-    ddx_local: vec2<f32>,
-    ddy_local: vec2<f32>,
+    layer_weights: vec4<f32>,
 ) -> Accum {
     let layer_id = min(id, last_layer());
     let layer = i32(layer_id);
     let scale = uv_scale_for(layer_id);
-    let tiled = detile(
-        local_xz * scale, ddx_local * scale, ddy_local * scale, detile_for(layer_id));
-
-    // One sample per tile, blended after sampling: a rigid UV and its own
-    // derivatives per tap, so no tap is stretched by its neighbours.
-    // Four taps of three arrays across four control corners is 96 reads
-    // per fragment where a single cell with detiling off takes 24.
-    var albedo_sum = vec3<f32>(0.0);
-    var height_sum = 0.0;
-    var normal_sum = vec3<f32>(0.0);
-    var occlusion_sum = 0.0;
-    var roughness_sum = 0.0;
-    var taken = 0.0;
+    let stats = splat.slot_stats[layer_id];
     let has_occlusion = ((splat.occlusion_slots >> layer_id) & 1u) != 0u;
     let has_roughness = ((splat.roughness_slots >> layer_id) & 1u) != 0u;
-    for (var t = 0u; t < tiled.count; t++) {
-        let tap = tiled.taps[t];
-        // A tile whose share has fallen to nothing is three samples that
-        // change no pixel. The gradients are explicit, so this branch does
-        // not have to be uniform.
-        if tap.weight <= 1e-4 {
+    // Past the far band the maps below the albedo are not read, and the slot's
+    // averages stand in for them.
+    let detailed = frame.far < 1.0;
+
+    var albedo = vec3<f32>(0.0);
+    var height = 0.0;
+    var normal_top = vec3<f32>(0.0);
+    var normal_side = vec3<f32>(0.0);
+    // The slot's average stands in for the map until the planes below have
+    // something better to say, which is where the far band stays.
+    var occlusion = stats.w;
+    var roughness_sample = stats.z;
+    if detailed {
+        occlusion = 0.0;
+        roughness_sample = 0.0;
+    }
+    for (var plane = 0u; plane < 3u; plane++) {
+        let plane_weight = frame.planes[plane];
+        if plane_weight <= 0.0 {
             continue;
         }
-        albedo_sum += tap.weight
-            * textureSampleGrad(albedo_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).rgb;
-        height_sum += tap.weight
-            * textureSampleGrad(height_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;
-        let packed =
-            textureSampleGrad(normal_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).rgb;
-        let unpacked = packed * 2.0 - 1.0;
-        // This tap's UV was turned by `tap.turn`, so its texture reads
-        // rotated by the inverse across the surface and the tangent-space
-        // normal stored in it has to turn back before the tiles are
-        // blended. Green is already in the shader's convention:
-        // `flip_normal_y` is applied on the way into the array.
-        let back = turned_by(unpacked.xy, vec2<f32>(tap.turn.x, -tap.turn.y));
-        normal_sum += tap.weight * vec3<f32>(back, unpacked.z);
-        // A layer with no map of its own holds a filled array layer, so
-        // it is not sampled: it contributes the identity instead,
-        // unoccluded and at full roughness before the slot's own value.
-        if has_occlusion {
-            occlusion_sum += tap.weight * textureSampleGrad(
-                occlusion_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;
-        } else {
-            occlusion_sum += tap.weight;
+        // This plane's position and derivatives in repeats of the texture. The
+        // side planes' V runs down the image while Y runs up the world.
+        var uv = frame.top * scale;
+        var ddx = frame.top_ddx * scale;
+        var ddy = frame.top_ddy * scale;
+        var strength = detile_for(layer_id);
+        if plane == 1u {
+            uv = vec2<f32>(frame.local.z, -frame.local.y) * scale;
+            ddx = vec2<f32>(frame.local_ddx.z, -frame.local_ddx.y) * scale;
+            ddy = vec2<f32>(frame.local_ddy.z, -frame.local_ddy.y) * scale;
+            strength = 0.0;
+        } else if plane == 2u {
+            uv = vec2<f32>(frame.local.x, -frame.local.y) * scale;
+            ddx = vec2<f32>(frame.local_ddx.x, -frame.local_ddx.y) * scale;
+            ddy = vec2<f32>(frame.local_ddy.x, -frame.local_ddy.y) * scale;
+            strength = 0.0;
         }
-        if has_roughness {
-            roughness_sum += tap.weight * textureSampleGrad(
-                roughness_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).g;
-        } else {
-            roughness_sum += tap.weight;
+        let tiled = detile(uv, ddx, ddy, strength);
+
+        // One sample per tile, blended after sampling: a rigid UV and its own
+        // derivatives per tap, so no tap is stretched by its neighbours. A
+        // detiled top plane takes four taps of up to five arrays, and every
+        // other plane one tap; the far band reads two arrays a tap, not five.
+        var albedo_sum = vec3<f32>(0.0);
+        var height_sum = 0.0;
+        var normal_sum = vec3<f32>(0.0);
+        var occlusion_sum = 0.0;
+        var roughness_sum = 0.0;
+        var taken = 0.0;
+        for (var t = 0u; t < tiled.count; t++) {
+            let tap = tiled.taps[t];
+            // A tile whose share has fallen to nothing is three samples that
+            // change no pixel. The gradients are explicit, so this branch does
+            // not have to be uniform.
+            if tap.weight <= 1e-4 {
+                continue;
+            }
+            albedo_sum += tap.weight
+                * textureSampleGrad(albedo_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).rgb;
+            height_sum += tap.weight
+                * textureSampleGrad(height_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;
+            taken += tap.weight;
+            if !detailed {
+                continue;
+            }
+            let packed =
+                textureSampleGrad(normal_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).rgb;
+            let unpacked = packed * 2.0 - 1.0;
+            // This tap's UV was turned by `tap.turn`, so its texture reads
+            // rotated by the inverse across the surface and the tangent-space
+            // normal stored in it has to turn back before the tiles are
+            // blended. Green is already in the shader's convention:
+            // `flip_normal_y` is applied on the way into the array.
+            let back = turned_by(unpacked.xy, vec2<f32>(tap.turn.x, -tap.turn.y));
+            normal_sum += tap.weight * vec3<f32>(back, unpacked.z);
+            // A layer with no map of its own holds a filled array layer, so
+            // it is not sampled: it contributes the identity instead,
+            // unoccluded and at full roughness before the slot's own value.
+            if has_occlusion {
+                occlusion_sum += tap.weight * textureSampleGrad(
+                    occlusion_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;
+            } else {
+                occlusion_sum += tap.weight;
+            }
+            if has_roughness {
+                roughness_sum += tap.weight * textureSampleGrad(
+                    roughness_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).g;
+            } else {
+                roughness_sum += tap.weight;
+            }
         }
-        taken += tap.weight;
+        let inv_taps = 1.0 / max(taken, 1e-8);
+        albedo += plane_weight * albedo_sum * inv_taps;
+        height += plane_weight * height_sum * inv_taps;
+        if detailed {
+            let tangent = normal_sum * inv_taps;
+            if plane == 0u {
+                normal_top += plane_weight * tangent;
+            } else {
+                // Whiteout blend (Ben Golus, "Normal Mapping for a Triplanar
+                // Shader"): the plane's tangent-space normal, added to the
+                // surface normal swizzled into the plane's own axes, then
+                // swizzled back to world axes. This shader's tangent Y follows
+                // +V, which on a side plane is down the image, so it is
+                // world -Y; flipping it first leaves everything below in
+                // world orientation, and the same bump reads the same on every
+                // plane. `abs` keeps the plane's back side from inverting.
+                let flipped = vec3<f32>(tangent.x, -tangent.y, tangent.z);
+                if plane == 1u {
+                    // U runs along +Z; the surface's X is the plane's normal.
+                    let blended = vec3<f32>(
+                        flipped.xy + frame.normal.zy,
+                        abs(flipped.z) * frame.normal.x,
+                    );
+                    normal_side += plane_weight * blended.zyx;
+                } else {
+                    // U runs along +X; the surface's Z is the plane's normal.
+                    let blended = vec3<f32>(
+                        flipped.xy + frame.normal.xy,
+                        abs(flipped.z) * frame.normal.z,
+                    );
+                    normal_side += plane_weight * blended;
+                }
+            }
+            occlusion += plane_weight * occlusion_sum * inv_taps;
+            roughness_sample += plane_weight * roughness_sum * inv_taps;
+        }
     }
-    let own_roughness = slot_value(splat.slot_roughness, layer_id);
+    if detailed && frame.far > 0.0 {
+        // The fade ring: both, mixed by how far into it the fragment is.
+        occlusion = mix(occlusion, stats.w, frame.far);
+        roughness_sample = mix(roughness_sample, stats.z, frame.far);
+    }
+
+    // With a colour map the colour is the map's and the texture supplies only
+    // its light and dark, relative to its own average, as far as the slot
+    // gives up its colour. A slot that keeps all of it draws as it always did.
+    if splat.colour_map_scale > 0u && stats.x < 1.0 {
+        let grainy = frame.colour * (luminance(albedo) / stats.y);
+        albedo = mix(grainy, albedo, stats.x);
+    }
+
+    let own_roughness = slot_roughness_for(layer_id);
     var roughness_scale = 1.0;
     if own_roughness >= 0.0 {
         roughness_scale = own_roughness;
     } else if !has_roughness {
         roughness_scale = splat.perceptual_roughness;
     }
-    let own_reflectance = slot_value(splat.slot_reflectance, layer_id);
+    let own_reflectance = slot_reflectance_for(layer_id);
     let reflectance = select(DEFAULT_REFLECTANCE, own_reflectance, own_reflectance >= 0.0);
-    let inv_taps = 1.0 / max(taken, 1e-8);
-    let albedo = albedo_sum * inv_taps;
-    let height = height_sum * inv_taps;
-    let normal = normal_sum * inv_taps;
-    let occlusion = occlusion_sum * inv_taps;
-    let roughness = min(roughness_sum * inv_taps * roughness_scale, 1.0);
+    let roughness = min(roughness_sample * roughness_scale, 1.0);
 
     let sharpness = SHARPNESS_MIN + SHARPNESS_RANGE * splat.blend_sharpness;
-    let contested = vec4<f32>(layer_weight + height);
+    let contested = layer_weights + vec4<f32>(height);
     let weight = dot(pow(corner_weights + contested, vec4<f32>(sharpness)), corner_weights);
 
     var out = accum;
     out.albedo += albedo * weight;
-    out.normal += normal * weight;
+    out.normal_top += normal_top * weight;
+    out.normal_side += normal_side * weight;
     out.occlusion += occlusion * weight;
     out.roughness += roughness * weight;
     out.reflectance += reflectance * weight;
@@ -391,44 +590,24 @@ fn accumulate(
     return out;
 }
 
-// Both of a control word's layers.
-//
-// The two guards must between them cover every word, or a fragment
-// accumulates nothing and normalizes zero by zero. `blend < 1.0` covers
-// the base for every blend but full overlay; the overlay covers the rest.
-// The `overlay_id != base_id` skip is an optimization, blending a texture
-// with itself being that texture, so it must not apply at full overlay,
-// where the base has already been skipped. A word naming the same id twice
-// at blend 255 is the case that would otherwise fall through both.
-fn accumulate_control(
-    accum: Accum,
-    control: u32,
-    corner_weights: vec4<f32>,
-    local_xz: vec2<f32>,
-    ddx_local: vec2<f32>,
-    ddy_local: vec2<f32>,
-) -> Accum {
-    let base_id = (control >> BASE_SHIFT) & BASE_MASK;
-    let overlay_id = (control >> OVERLAY_SHIFT) & OVERLAY_MASK;
-    let blend = f32((control >> BLEND_SHIFT) & BLEND_MASK) / 255.0;
+// The control word's fields.
+fn base_of(control: u32) -> u32 {
+    return (control >> BASE_SHIFT) & BASE_MASK;
+}
 
-    var out = accum;
-    if blend < 1.0 {
-        out = accumulate(
-            out, base_id, corner_weights, 1.0 - blend, local_xz, ddx_local, ddy_local);
-    }
-    if blend >= 1.0 || (blend > 0.0 && overlay_id != base_id) {
-        out = accumulate(
-            out, overlay_id, corner_weights, blend, local_xz, ddx_local, ddy_local);
-    }
-    return out;
+fn overlay_of(control: u32) -> u32 {
+    return (control >> OVERLAY_SHIFT) & OVERLAY_MASK;
+}
+
+fn blend_of(control: u32) -> f32 {
+    return f32((control >> BLEND_SHIFT) & BLEND_MASK) / 255.0;
 }
 
 // The control word a cell's own slope stands for.
 //
 // A word, not a colour: the two slots and the blend between them are what a hand
-// would have painted for this slope, so the fragment carries on into
-// `accumulate_control` and picks up the height blend, the detiling and the mip
+// would have painted for this slope, so the fragment carries on into the
+// layers below and picks up the height blend, the detiling and the mip
 // derivatives that painted ground gets.
 //
 // `smoothstep` across the authored range means flat ground is purely the base
@@ -441,14 +620,122 @@ fn autoterrain_control(slope: f32) -> u32 {
         | ((blend & BLEND_MASK) << BLEND_SHIFT);
 }
 
+// How a ray going into the ground stands against the heightfield `travel`
+// metres along it: how far below the surface the ray is, less how far below the
+// top of the shell the heightfield is there. At or under the surface is >= 0.
+//
+// `uv` is where the ray enters, in the dominant tile's own frame, and
+// `uv_per_metre` is how far the sample moves per metre of travel, in the same
+// frame. `steepness` is the ray's share along the surface normal, so the depth
+// it has reached is `travel * steepness`.
+fn relief_gap(
+    layer: i32,
+    uv: vec2<f32>,
+    ddx: vec2<f32>,
+    ddy: vec2<f32>,
+    uv_per_metre: vec2<f32>,
+    steepness: f32,
+    depth: f32,
+    travel: f32,
+) -> f32 {
+    // The unshifted derivatives, as in any parallax lookup: the shift is small
+    // against the texture's own scale and does not change its filtering.
+    let height = textureSampleGrad(
+        height_array, layer_sampler, uv + uv_per_metre * travel, layer, ddx, ddy).r;
+    return travel * steepness - (1.0 - height) * depth;
+}
+
+// The distance along the ray, in metres, at which it meets the heightfield.
+//
+// Ported from `parallax_field_trace` and `parallax_field_refine` in
+// crates/parallax/src/shaders/parallax_field.wgsl of the Hayjump monorepo, for
+// a surface with no sides to leave through. The step budget runs from
+// `RELIEF_MIN_STEPS` head on to `RELIEF_MAX_STEPS` at a grazing angle, and
+// `lod` thins it back toward the head-on count.
+fn relief_travel(
+    layer: i32,
+    uv: vec2<f32>,
+    ddx: vec2<f32>,
+    ddy: vec2<f32>,
+    uv_per_metre: vec2<f32>,
+    steepness: f32,
+    depth: f32,
+    lod: f32,
+) -> f32 {
+    // Grazing rays cross many texels per unit of depth, so they get the larger
+    // budget.
+    let full = RELIEF_MAX_STEPS + (RELIEF_MIN_STEPS - RELIEF_MAX_STEPS) * steepness;
+    let count = max(RELIEF_MIN_STEPS + (full - RELIEF_MIN_STEPS) * clamp(lod, 0.0, 1.0), 1.0);
+    // One step is a fraction of the ray that crosses the whole shell.
+    let reach = depth / max(steepness, RELIEF_MIN_STEEPNESS);
+    let dt = reach / count;
+    let steps = u32(ceil(count));
+
+    // A ray that enters at or under the surface has nothing to march through.
+    if relief_gap(layer, uv, ddx, ddy, uv_per_metre, steepness, depth, 0.0) >= 0.0 {
+        return 0.0;
+    }
+    var previous = 0.0;
+    var travel = 0.0;
+    for (var i = 0u; i < steps; i++) {
+        travel += dt;
+        if relief_gap(layer, uv, ddx, ddy, uv_per_metre, steepness, depth, travel) >= 0.0 {
+            // Binary search between the last sample above and this one below.
+            var above = previous;
+            var below = travel;
+            for (var j = 0u; j < RELIEF_REFINE_STEPS; j++) {
+                let middle = (above + below) * 0.5;
+                if relief_gap(layer, uv, ddx, ddy, uv_per_metre, steepness, depth, middle) >= 0.0 {
+                    below = middle;
+                } else {
+                    above = middle;
+                }
+            }
+            return (above + below) * 0.5;
+        }
+        previous = travel;
+    }
+    // Out of budget without crossing anything: stay at the last sample rather
+    // than punch a hole in the surface.
+    return previous;
+}
+
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     // UV0 is 0..1 across the whole terrain, shared bit for bit by chunks
     // that meet on a grid line, which is what keeps the control lookup
     // seamless across a chunk join.
     let local_xz = (in.uv - vec2<f32>(0.5)) * splat.terrain_size;
-    let ddx_local = dpdx(local_xz);
-    let ddy_local = dpdy(local_xz);
+    frame.top = local_xz;
+    frame.top_ddx = dpdx(local_xz);
+    frame.top_ddy = dpdy(local_xz);
+
+    // The fragment in the terrain's own space, for the side planes. The chunks
+    // are children of the terrain with no transform of their own, so this is
+    // the same space for every chunk of one terrain.
+    let local_from_world = get_local_from_world(in.instance_index);
+    let local = (local_from_world * vec4<f32>(in.world_position.xyz, 1.0)).xyz;
+    frame.local = local;
+    frame.local_ddx = dpdx(local);
+    frame.local_ddy = dpdy(local);
+
+    // The distance bands. An orthographic view has no eye to measure from, and
+    // a shadow cascade is one: it gets neither band, so it draws the same ground
+    // wherever the camera is.
+    let is_ortho = view.clip_from_view[3].w == 1.0;
+    let eye_distance = distance(in.world_position.xyz, view.world_position);
+    frame.near = 0.0;
+    frame.far = 0.0;
+    if !is_ortho {
+        if splat.near_distance > 0.0 {
+            frame.near = 1.0 - smoothstep(
+                splat.near_distance, splat.near_distance * 4.0 / 3.0, eye_distance);
+        }
+        if splat.far_distance > 0.0 {
+            frame.far = smoothstep(
+                splat.far_distance, splat.far_distance * 4.0 / 3.0, eye_distance);
+        }
+    }
 
     // The tint is sampled, not loaded: it is a colour, so two of them interpolate
     // into a colour. Taken here, with the derivatives, because the per-layer
@@ -461,6 +748,61 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let tint_res = f32(max(splat.control_resolution, 2u));
     let tint_uv = (in.uv * (tint_res - 1.0) + 0.5) / tint_res;
     let tint = textureSample(tint_map, tint_sampler, tint_uv).rgb;
+
+    // The colour map is laid out the same way over its own, finer grid: texel
+    // `scale * i` sits on grid point `i`. `render::colour_map_uv` spells the
+    // same mapping in Rust. The branch is on a uniform, so the sample stays in
+    // uniform control flow.
+    frame.colour = vec3<f32>(1.0);
+    if splat.colour_map_scale > 0u {
+        let colour_res = f32(max(splat.colour_map_side, 2u));
+        let colour_uv = (in.uv * (colour_res - 1.0) + 0.5) / colour_res;
+        frame.colour = textureSample(colour_map, colour_map_sampler, colour_uv).rgb;
+    }
+
+    // The surface's normal, and the frame the top plane's normals are read in.
+    //
+    // The mesher emits no tangents: UV0 runs along world X and Z, so the tangent
+    // is world +X projected onto the surface normal. That projection collapses
+    // where the surface stands vertical and faces X, so +Z stands in there.
+    // Picking the axis the normal leans on least would swap the frame by 90
+    // degrees wherever |n.x| and |n.z| cross, seaming flat ground.
+    let world_normal = pbr_functions::prepare_world_normal(in.world_normal, false, is_front);
+    let n = normalize(world_normal);
+    frame.normal = n;
+    var reference = vec3<f32>(1.0, 0.0, 0.0);
+    if abs(n.x) > 0.999 {
+        reference = vec3<f32>(0.0, 0.0, 1.0);
+    }
+    let t = normalize(reference - n * dot(reference, n));
+    let b = cross(t, n);
+    let tbn = mat3x3<f32>(t, b, n);
+
+    // How the three projections share this fragment. The ground's own up is the
+    // terrain's Y, so the normal is taken into terrain space first.
+    let world_from_local = get_world_from_local(in.instance_index);
+    let to_local = transpose(mat3x3<f32>(
+        world_from_local[0].xyz, world_from_local[1].xyz, world_from_local[2].xyz));
+    let local_normal = normalize(to_local * n);
+    let steep = smoothstep(STEEP_START, STEEP_END, 1.0 - local_normal.y);
+    frame.planes = vec3<f32>(1.0, 0.0, 0.0);
+    if steep > 0.0 {
+        // The sharper the split, the more the dominant side axis takes. Each
+        // side's lean is taken against the larger of the two first, so the
+        // dominant one is 1 whatever the power does to a small number.
+        let split = mix(SPLIT_SHARP, SPLIT_SOFT, frame.near);
+        let lean = abs(local_normal.xz);
+        let along = pow(lean / max(max(lean.x, lean.y), 1e-6), vec2<f32>(split));
+        var planes = vec3<f32>(1.0 - steep, steep * along / max(along.x + along.y, 1e-6));
+        // A plane with next to no share is not worth its reads.
+        planes = select(planes, vec3<f32>(0.0), planes < vec3<f32>(PLANE_CUTOFF));
+        // The shares sum to 1, so one is always left; a surface facing straight
+        // down leans nowhere, and has only the top plane to fall back on.
+        let total = planes.x + planes.y + planes.z;
+        if total > 0.0 {
+            frame.planes = planes / total;
+        }
+    }
 
     let g = in.uv * f32(max(splat.control_resolution, 2u) - 1u);
     let corner = control_corner(g);
@@ -486,52 +828,218 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let inv = vec2<f32>(1.0) - f;
     let w = vec4<f32>(inv.x * inv.y, f.x * inv.y, inv.x * f.y, f.x * f.y);
 
+    // The texture ids this fragment reads, each with the share of the four
+    // corners that name it and the weight it has in each of those corners. At
+    // most eight: two layers in each of four words. Kept in arrays local to this
+    // function and never handed to another one, which would copy them on every
+    // call.
+    var entry_ids: array<u32, 8>;
+    var entry_corners: array<vec4<f32>, 8>;
+    var entry_layers: array<vec4<f32>, 8>;
+    var entries = 0u;
+
+    // A word names its base layer unless it is a full overlay, and its overlay
+    // layer when it is a full overlay or a partial one over a different id. The
+    // guards must between them cover every word, or a fragment reads nothing and
+    // normalizes zero by zero. Blending a texture with itself is that texture,
+    // so the same id twice at a partial blend reads once; at full blend the base
+    // has already been skipped, which is the case that would otherwise fall
+    // through both.
+    if c00 == c10 && c00 == c01 && c00 == c11 {
+        // Every unpainted fragment, and the interior of every uniformly painted
+        // area: one control word, so there is nothing to merge. The corner
+        // shares are all four of them.
+        let blend = blend_of(c00);
+        if blend < 1.0 {
+            entry_ids[entries] = base_of(c00);
+            entry_corners[entries] = w;
+            entry_layers[entries] = vec4<f32>(1.0 - blend);
+            entries += 1u;
+        }
+        if blend >= 1.0 || (blend > 0.0 && overlay_of(c00) != base_of(c00)) {
+            entry_ids[entries] = overlay_of(c00);
+            entry_corners[entries] = w;
+            entry_layers[entries] = vec4<f32>(blend);
+            entries += 1u;
+        }
+    } else {
+        // Words that differ: merge the corners that name the same id, so an id
+        // is read once however many corners it is in. A corner that does not
+        // name it keeps a corner share of zero, which is what makes the sum in
+        // `accumulate` the sum the separate per-corner calls made.
+        var words = array<u32, 4>(c00, c10, c01, c11);
+        for (var k = 0u; k < 4u; k++) {
+            let word = words[k];
+            let blend = blend_of(word);
+            let corner_mask = vec4<bool>(k == 0u, k == 1u, k == 2u, k == 3u);
+            for (var layer = 0u; layer < 2u; layer++) {
+                var id = base_of(word);
+                var layer_weight = 1.0 - blend;
+                var named = blend < 1.0;
+                if layer == 1u {
+                    id = overlay_of(word);
+                    layer_weight = blend;
+                    named = blend >= 1.0 || (blend > 0.0 && id != base_of(word));
+                }
+                if !named {
+                    continue;
+                }
+                var slot = entries;
+                for (var e = 0u; e < entries; e++) {
+                    if entry_ids[e] == id {
+                        slot = e;
+                        break;
+                    }
+                }
+                if slot == entries {
+                    entry_ids[slot] = id;
+                    entry_corners[slot] = vec4<f32>(0.0);
+                    entry_layers[slot] = vec4<f32>(0.0);
+                    entries += 1u;
+                }
+                // Written through a mask rather than by component: a dynamic
+                // index into a vector store is not available everywhere.
+                entry_corners[slot] = select(entry_corners[slot], vec4<f32>(w[k]), corner_mask);
+                entry_layers[slot] = select(entry_layers[slot], vec4<f32>(layer_weight), corner_mask);
+            }
+        }
+    }
+
+    // The id with the largest share of the fragment, before the height blend
+    // has a say. It is the one the relief and the grain are made from.
+    var dominant = 0u;
+    var dominant_share = -1.0;
+    for (var e = 0u; e < entries; e++) {
+        let share = dot(entry_corners[e], entry_layers[e]);
+        if share > dominant_share {
+            dominant_share = share;
+            dominant = e;
+        }
+    }
+    let dominant_id = min(entry_ids[dominant], last_layer());
+    let dominant_layer = i32(dominant_id);
+    let dominant_scale = uv_scale_for(dominant_id);
+
+    // Parallax relief: march a ray from the eye into a shell of `relief_depth`
+    // under the top plane, against the dominant texture's height map, and shift
+    // the top plane's position, for every id, to where it met it. Colour and
+    // normals are read there afterwards; nothing here writes depth, so the
+    // silhouette of the ground is the mesh's.
+    //
+    // Only where it can be seen and is worth it: near the camera, on a texture
+    // that has a height map of its own, on ground the top plane mostly covers.
+    let has_height = ((splat.height_slots >> dominant_id) & 1u) != 0u;
+    if frame.near > 0.0 && splat.relief_depth > 0.0 && has_height && frame.planes.x > 0.5 {
+        // The view in the top plane's frame. The ray goes the other way, into
+        // the ground.
+        let to_eye = normalize(view.world_position - in.world_position.xyz);
+        let eye_in_frame = vec3<f32>(dot(to_eye, t), dot(to_eye, b), dot(to_eye, n));
+        if eye_in_frame.z > 0.01 {
+            let ray = -normalize(eye_in_frame);
+            let steepness = abs(ray.z);
+            // The shell fades out with the band, so relief does not pop away at
+            // its far edge.
+            let depth = splat.relief_depth * frame.near;
+            // Metres of sideways travel in the top plane's X and Z, per metre of
+            // travel along the ray. The plane is planar in X and Z, so what
+            // moves the sample is the ray's X and Z, not its length along the
+            // slope.
+            let xz_per_metre = ray.x * vec2<f32>(t.x, t.z) + ray.y * vec2<f32>(b.x, b.z);
+            // The dominant texture's own tile frame at this fragment. With
+            // detiling off there is one tap and this is the plain tiling; with
+            // it on, the tile that has most of the fragment.
+            let tiled = detile(
+                frame.top * dominant_scale,
+                frame.top_ddx * dominant_scale,
+                frame.top_ddy * dominant_scale,
+                detile_for(dominant_id),
+            );
+            var tap = tiled.taps[0];
+            for (var i = 1u; i < tiled.count; i++) {
+                if tiled.taps[i].weight > tap.weight {
+                    tap = tiled.taps[i];
+                }
+            }
+            let uv_per_metre = turned_by(xz_per_metre * dominant_scale, tap.turn);
+            let travel = relief_travel(
+                dominant_layer, tap.uv, tap.ddx, tap.ddy, uv_per_metre, steepness, depth, frame.near);
+            frame.top += xz_per_metre * travel;
+        }
+    }
+
     var accum: Accum;
     accum.albedo = vec3<f32>(0.0);
-    accum.normal = vec3<f32>(0.0);
+    accum.normal_top = vec3<f32>(0.0);
+    accum.normal_side = vec3<f32>(0.0);
     accum.occlusion = 0.0;
     accum.roughness = 0.0;
     accum.reflectance = 0.0;
     accum.total = 0.0;
-
-    if c00 == c10 && c00 == c01 && c00 == c11 {
-        // Every unpainted fragment, and the interior of every uniformly painted
-        // area: one control word, so four taps would sample the same textures
-        // four times. Passing all four corner weights to one call sums the same
-        // four terms the branch below sums separately.
-        accum = accumulate_control(accum, c00, w, local_xz, ddx_local, ddy_local);
-    } else {
-        accum = accumulate_control(
-            accum, c00, vec4<f32>(w.x, 0.0, 0.0, 0.0), local_xz, ddx_local, ddy_local);
-        accum = accumulate_control(
-            accum, c10, vec4<f32>(0.0, w.y, 0.0, 0.0), local_xz, ddx_local, ddy_local);
-        accum = accumulate_control(
-            accum, c01, vec4<f32>(0.0, 0.0, w.z, 0.0), local_xz, ddx_local, ddy_local);
-        accum = accumulate_control(
-            accum, c11, vec4<f32>(0.0, 0.0, 0.0, w.w), local_xz, ddx_local, ddy_local);
+    for (var e = 0u; e < entries; e++) {
+        let corners = entry_corners[e];
+        // A corner share of nothing on every corner, as on a grid line, is a
+        // set of reads that change no pixel.
+        if corners.x + corners.y + corners.z + corners.w <= 0.0 {
+            continue;
+        }
+        accum = accumulate(accum, entry_ids[e], corners, entry_layers[e]);
     }
 
     let inv_total = 1.0 / max(accum.total, 1e-8);
-    let albedo = accum.albedo * inv_total * mix(vec3<f32>(1.0), tint, splat.tint_strength);
-    let tangent_normal = accum.normal * inv_total;
+    var albedo = accum.albedo * inv_total;
+
+    // Grain: one more read of the dominant texture, at four times its tiling on
+    // the plane that has most of the fragment, laid over the albedo as the
+    // ratio of its light to the texture's average. It brings back the fine
+    // detail a colour map is too coarse to carry.
+    if frame.near > 0.0 && splat.grain > 0.0 {
+        var uv = frame.top * dominant_scale;
+        var ddx = frame.top_ddx * dominant_scale;
+        var ddy = frame.top_ddy * dominant_scale;
+        if frame.planes.y > frame.planes.x && frame.planes.y >= frame.planes.z {
+            uv = vec2<f32>(frame.local.z, -frame.local.y) * dominant_scale;
+            ddx = vec2<f32>(frame.local_ddx.z, -frame.local_ddx.y) * dominant_scale;
+            ddy = vec2<f32>(frame.local_ddy.z, -frame.local_ddy.y) * dominant_scale;
+        } else if frame.planes.z > frame.planes.x {
+            uv = vec2<f32>(frame.local.x, -frame.local.y) * dominant_scale;
+            ddx = vec2<f32>(frame.local_ddx.x, -frame.local_ddx.y) * dominant_scale;
+            ddy = vec2<f32>(frame.local_ddy.x, -frame.local_ddy.y) * dominant_scale;
+        }
+        let fine = textureSampleGrad(
+            albedo_array,
+            layer_sampler,
+            uv * GRAIN_TILING,
+            dominant_layer,
+            ddx * GRAIN_TILING,
+            ddy * GRAIN_TILING,
+        ).rgb;
+        let dominant_luminance = splat.slot_stats[dominant_id].y;
+        albedo *= mix(1.0, luminance(fine) / dominant_luminance, splat.grain * frame.near);
+    }
+
+    albedo *= mix(vec3<f32>(1.0), tint, splat.tint_strength);
     let occlusion = accum.occlusion * inv_total;
     let roughness = accum.roughness * inv_total;
     let reflectance = accum.reflectance * inv_total;
 
-    // The mesher emits no tangents: UV0 runs along world X and Z, so the tangent
-    // is world +X projected onto the surface normal. That projection collapses
-    // where the surface stands vertical and faces X, so +Z stands in there.
-    // Picking the axis the normal leans on least would swap the frame by 90
-    // degrees wherever |n.x| and |n.z| cross, seaming flat ground.
-    let world_normal = pbr_functions::prepare_world_normal(in.world_normal, false, is_front);
-    let n = normalize(world_normal);
-    var reference = vec3<f32>(1.0, 0.0, 0.0);
-    if abs(n.x) > 0.999 {
-        reference = vec3<f32>(0.0, 0.0, 1.0);
+    // The top plane's tangent-space normals take the frame above, the side
+    // planes' are in world axes already. Out in the far band no normal map was
+    // read and the surface's own normal stands; in the fade ring the two are
+    // mixed.
+    var mapped_normal = n;
+    if frame.far < 1.0 {
+        if frame.planes.x >= 1.0 {
+            // The top plane alone, which is all of flat ground: the sum, the
+            // frame and the normalisation in the order they have always been
+            // taken, so flat ground comes out bit for bit as it did.
+            mapped_normal = normalize(tbn * normalize(accum.normal_top * inv_total));
+        } else {
+            mapped_normal = normalize((tbn * accum.normal_top + accum.normal_side) * inv_total);
+        }
+        if frame.far > 0.0 {
+            mapped_normal = normalize(mix(mapped_normal, n, frame.far));
+        }
     }
-    let t = normalize(reference - n * dot(reference, n));
-    let tbn = mat3x3<f32>(t, cross(t, n), n);
-    let mapped_normal = normalize(tbn * normalize(tangent_normal));
 
     var pbr_input = pbr_types::pbr_input_new();
     // Mesh flags carry the shadow-receiver and transmitted-shadow-receiver
@@ -550,7 +1058,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     pbr_input.world_position = in.world_position;
     pbr_input.world_normal = n;
     pbr_input.N = mapped_normal;
-    pbr_input.is_orthographic = view.clip_from_view[3].w == 1.0;
+    pbr_input.is_orthographic = is_ortho;
     pbr_input.V = pbr_functions::calculate_view(in.world_position, pbr_input.is_orthographic);
 
     var out: FragmentOutput;

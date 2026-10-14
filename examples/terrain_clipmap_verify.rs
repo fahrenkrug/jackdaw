@@ -47,8 +47,8 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
 use jackdaw_terrain::render::{
-    SplatArrayHandles, SplatBuildError, TerrainRenderPlugin, TerrainSplatMaterial,
-    TextureSetImages, control_image, slope_image, splat_images,
+    ColourMapBinding, SplatArrayHandles, SplatBuildError, TerrainRenderPlugin,
+    TerrainSplatMaterial, TextureSetImages, control_image, slope_image, splat_images,
 };
 use jackdaw_terrain::sidecar::AutoTerrainSettings;
 use jackdaw_terrain::splat::ControlTexels;
@@ -399,14 +399,18 @@ fn attach_material(
         height: images.add(built.height),
         occlusion: images.add(built.occlusion),
         roughness: images.add(built.roughness),
+        stats: built.stats,
     };
     let tint = images.add(jackdaw_terrain::render::tint_image(&[], PLATE_RESOLUTION));
+    let colour_map = ColourMapBinding::upload(None, &mut images);
     let material = materials.add(TerrainSplatMaterial::new(
         &verify.set,
+        &[],
         arrays,
         control,
         slope,
         tint,
+        colour_map,
         Vec2::splat(PLATE_SIZE),
         PLATE_RESOLUTION,
         AutoTerrainSettings::default(),

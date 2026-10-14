@@ -12,6 +12,15 @@
 //! The blend is height-weighted rather than a cross-fade: a layer's weight is
 //! `pow(corner_weight + layer_weight + height, sharpness)`, normalized across
 //! every contributing layer. See `shaders/terrain_splat.wgsl`.
+//!
+//! Beyond that blend the material has a near band and a far band, set by
+//! [`SurfaceSettings`]. Close to the camera the ground gains parallax relief on
+//! the textures that have a height map, and a fine grain over a colour map; far
+//! from it the normal, occlusion and roughness maps give way to each slot's
+//! averages ([`SlotStats`]). Steep ground is projected from the sides as well as
+//! from above, so a cliff is not a texture smeared down a slope. And a terrain
+//! may carry a colour map baked outside the editor ([`ColourMap`]), which gives
+//! the colour while the slot textures give their light and dark.
 
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -25,6 +34,8 @@ use path_slash::PathExt as _;
 
 pub mod detail;
 pub mod scatter;
+#[cfg(test)]
+mod shader_mirror;
 
 pub use detail::{
     ATTRIBUTE_HEIGHT_FRACTION, BuiltDetailMesh, DETAIL_TILE_BUDGET, DETAIL_TILE_CELLS,
@@ -3273,6 +3284,241 @@ mod tests {
                 f32::from(scale) * i as f32,
                 "grid point {i}"
             );
+        }
+
+        assert!(
+            SHADER_SOURCE.contains("(in.uv * (colour_res - 1.0) + 0.5) / colour_res"),
+            "the fragment must sample the colour map at texel centres, as `colour_map_uv` does"
+        );
+    }
+
+    /// The body of a function in the shader, from its signature to the next
+    /// function.
+    fn shader_function(name: &str) -> &'static str {
+        let start = SHADER_SOURCE
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("the shader declares {name}"));
+        let rest = &SHADER_SOURCE[start..];
+        let end = rest[1..]
+            .find("\nfn ")
+            .or_else(|| rest[1..].find("\n@fragment"))
+            .map_or(rest.len(), |at| at + 1);
+        &rest[..end]
+    }
+
+    /// Naga's Metal backend copies an array handed to a function by value on
+    /// every call, which cost another renderer ~75 ms a frame. Nothing here takes
+    /// one: the packed uniform arrays are read in place, and the eight texture
+    /// entries a fragment merges live in `fragment` and are never passed on.
+    #[test]
+    fn no_shader_function_takes_an_array_by_value() {
+        let mut checked = 0;
+        for (at, _) in SHADER_SOURCE.match_indices("\nfn ") {
+            let signature = &SHADER_SOURCE[at..];
+            let open = signature
+                .find('(')
+                .expect("a function opens its parameters");
+            let close = signature
+                .find(") ")
+                .expect("a function closes its parameters");
+            let parameters = &signature[open..close];
+            assert!(
+                !parameters.contains("array<"),
+                "an array parameter in{}",
+                &signature[..close + 1]
+            );
+            checked += 1;
+        }
+        assert!(checked > 10, "the scan found {checked} functions");
+        assert!(SHADER_SOURCE.contains("var entry_ids: array<u32, 8>;"));
+    }
+
+    /// A normal map, an occlusion map and a roughness map are read behind
+    /// `detailed` and nowhere else, which is what makes the far band cost less
+    /// than the mid one.
+    #[test]
+    fn the_far_band_reads_no_normal_occlusion_or_roughness_map() {
+        let body = shader_function("accumulate");
+        let detailed = body
+            .find("if !detailed {")
+            .expect("the tap loop skips the rest in the far band");
+        for array in ["normal_array", "occlusion_array", "roughness_array"] {
+            let read = body
+                .find(&format!("{array}, layer_sampler"))
+                .unwrap_or_else(|| panic!("{array} is read"));
+            assert!(
+                read > detailed,
+                "{array} must be read after the far band has been skipped"
+            );
+        }
+        for array in ["albedo_array", "height_array"] {
+            let read = body
+                .find(&format!("{array}, layer_sampler"))
+                .unwrap_or_else(|| panic!("{array} is read"));
+            assert!(
+                read < detailed,
+                "{array} is read in every band, before the skip"
+            );
+        }
+    }
+
+    /// Derivatives, the tint and the colour map are taken before any branch on a
+    /// per-fragment value: the only code ahead of them that branches does so on a
+    /// uniform. Naga's uniformity analysis checks the rest, below.
+    #[test]
+    fn derivatives_and_implicit_samples_come_before_the_first_per_fragment_branch() {
+        let body = shader_function("fragment");
+        let first_branch = [body.find("if frame."), body.find("for (")]
+            .into_iter()
+            .flatten()
+            .min()
+            .expect("the fragment branches");
+        for call in [
+            "dpdx(local_xz)",
+            "dpdy(local_xz)",
+            "dpdx(local)",
+            "dpdy(local)",
+            "textureSample(tint_map",
+            "textureSample(colour_map",
+        ] {
+            let at = body
+                .find(call)
+                .unwrap_or_else(|| panic!("the fragment takes {call}"));
+            assert!(
+                at < first_branch,
+                "{call} comes after a per-fragment branch"
+            );
+        }
+        assert!(
+            body.contains("view.clip_from_view[3].w == 1.0"),
+            "an orthographic view gets neither band"
+        );
+    }
+
+    /// What of Bevy the splat shader leans on, as stubs: the vertex output, the
+    /// mesh and view data, and the lighting entry points. Everything else the
+    /// test composes is the production source.
+    const BEVY_STUBS: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) world_position: vec4<f32>,
+    @location(1) world_normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) @interpolate(flat) instance_index: u32,
+}
+struct FragmentOutput {
+    @location(0) color: vec4<f32>,
+}
+struct MeshStub {
+    flags: u32,
+}
+struct ViewStub {
+    clip_from_view: mat4x4<f32>,
+    world_position: vec3<f32>,
+}
+var<private> mesh: array<MeshStub, 1>;
+var<private> view: ViewStub;
+fn get_local_from_world(instance_index: u32) -> mat4x4<f32> {
+    return mat4x4<f32>(
+        vec4<f32>(1.0, 0.0, 0.0, 0.0),
+        vec4<f32>(0.0, 1.0, 0.0, 0.0),
+        vec4<f32>(0.0, 0.0, 1.0, 0.0),
+        vec4<f32>(0.0, 0.0, 0.0, 1.0),
+    );
+}
+fn get_world_from_local(instance_index: u32) -> mat4x4<f32> {
+    return get_local_from_world(instance_index);
+}
+struct StandardMaterialStub {
+    base_color: vec4<f32>,
+    perceptual_roughness: f32,
+    reflectance: vec3<f32>,
+    metallic: f32,
+    flags: u32,
+}
+struct PbrInput {
+    flags: u32,
+    material: StandardMaterialStub,
+    diffuse_occlusion: vec3<f32>,
+    frag_coord: vec4<f32>,
+    world_position: vec4<f32>,
+    world_normal: vec3<f32>,
+    N: vec3<f32>,
+    is_orthographic: bool,
+    V: vec3<f32>,
+}
+const STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT: u32 = 1u;
+fn pbr_input_new() -> PbrInput {
+    var input: PbrInput;
+    return input;
+}
+fn prepare_world_normal(world_normal: vec3<f32>, double_sided: bool, is_front: bool) -> vec3<f32> {
+    return world_normal;
+}
+fn calculate_view(world_position: vec4<f32>, is_orthographic: bool) -> vec3<f32> {
+    return vec3<f32>(0.0, 0.0, 1.0);
+}
+fn apply_pbr_lighting(input: PbrInput) -> vec4<f32> {
+    return input.material.base_color * vec4<f32>(input.N, input.V.z)
+        * input.diffuse_occlusion.x * input.material.perceptual_roughness
+        * input.material.reflectance.x;
+}
+fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4<f32> {
+    return color;
+}
+"#;
+
+    /// Compose the production splat shader and have naga validate it, with no
+    /// GPU: the types, the bindings, and the uniformity analysis that refuses an
+    /// implicit-derivative read (`textureSample`, `dpdx`) in divergent control
+    /// flow. A shader error otherwise surfaces only when the first frame builds
+    /// the pipeline.
+    ///
+    /// Only Bevy's own pieces are stubbed, and the shader's imports are cut,
+    /// the way the Hayjump monorepo validates its prepass. The shader cache
+    /// validates what it composes only with debug assertions on.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_splat_shader_composes_and_validates_against_stubs_of_bevys_pieces() {
+        use bevy::render::render_resource::{DownlevelFlags, WgpuFeatures};
+        use bevy::shader::{Shader, ShaderCache, ShaderCacheError, ShaderDefVal};
+
+        let import = SHADER_SOURCE
+            .find("#import")
+            .expect("the shader imports from bevy_pbr");
+        let import_end = import
+            + SHADER_SOURCE[import..]
+                .find("\n}\n")
+                .expect("the import block closes")
+            + 3;
+        let source = format!(
+            "{BEVY_STUBS}\n{}{}",
+            &SHADER_SOURCE[..import],
+            &SHADER_SOURCE[import_end..]
+        )
+        .replace("pbr_functions::", "")
+        .replace("pbr_types::", "");
+
+        let mut assets = Assets::<Shader>::default();
+        let shader = Shader::from_wgsl(source, "terrain-splat-test.wgsl");
+        let handle = assets.add(shader.clone());
+        let mut cache = ShaderCache::new(
+            (),
+            WgpuFeatures::empty(),
+            DownlevelFlags::all(),
+            |_, _, _| Ok(()),
+        );
+        cache.set_shader(handle.id(), shader);
+
+        let definitions = [ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 2)];
+        if let Err(error) = cache.get(0, handle.id(), &definitions) {
+            let reason = match &error {
+                ShaderCacheError::ProcessShaderError(composed) => {
+                    composed.emit_to_string(&cache.composer)
+                }
+                other => format!("{other:?}"),
+            };
+            panic!("the splat shader does not compose:\n{reason}");
         }
     }
 }
