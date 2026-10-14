@@ -194,6 +194,31 @@
 //! each read only where its flag is set. A version-10 or older file reads
 //! back with both unset, which shades exactly as those files did.
 //!
+//! # Format version 12
+//!
+//! Version 11 with three additions for the splat material's near and far
+//! detail. Each material slot ends with one more `f32`, its texture colour:
+//! how much of the slot's own texture colour it keeps against the terrain's
+//! colour map. The surface block grows from 8 bytes to 24, after the blend
+//! sharpness and the tint strength come four more `f32`s: the near distance,
+//! the far distance, the relief depth and the grain. And a colour map block
+//! follows the surface block, ahead of the scatter palette:
+//!
+//! ```text
+//! offset  size          field
+//!         1             scale, u8 (0 = no colour map; 1..=4 texels per
+//!                        grid cell)
+//!         3             padding, must be 0
+//!         4             side, u32 (texels per edge, at most 4096; 0
+//!                        where there is no map)
+//! then, only where scale is not 0:
+//!         4*side^2      colour map, RGBA8 sRGB, row-major
+//! ```
+//!
+//! A version-11 or older file reads back with every slot's texture colour at
+//! 1, the near distance at 30 metres, the far distance at 150, no relief, no
+//! grain and no colour map.
+//!
 //! [`load`] and [`save`] are the entry points: `load` upgrades older files
 //! forward and `save` always writes the current version, refusing anything
 //! newer than this build. The bare `encode`/`decode` and
@@ -263,9 +288,14 @@ pub const VERSION_9: u16 = 9;
 pub const VERSION_10: u16 = 10;
 
 /// Material slots that may set a perceptual roughness and a reflectance of
-/// their own. A version-10 or older file loads with both unset. What
-/// [`save`] writes.
+/// their own. A version-10 or older file loads with both unset.
 pub const VERSION_11: u16 = 11;
+
+/// Material slots that may give up their own texture colour to a colour map,
+/// a surface block with the near and far bands, the relief depth and the
+/// grain, and an optional colour map after it. A version-11 or older file
+/// loads with every one at its default. What [`save`] writes.
+pub const VERSION_12: u16 = 12;
 
 const SLOT_FLAG_ROUGHNESS: u8 = 1 << 0;
 const SLOT_FLAG_REFLECTANCE: u8 = 1 << 1;
@@ -481,6 +511,12 @@ pub struct TerrainMaterialSlot {
     /// `StandardMaterial`. `None` shades at
     /// [`crate::texture_set::DEFAULT_REFLECTANCE`].
     pub reflectance: Option<f32>,
+    /// How much of this slot's own texture colour shows when the terrain
+    /// carries a [`ColourMap`], `0..1`. 1 draws the texture as it is, which is
+    /// how every file before version 12 draws; 0 takes the colour map's
+    /// colour and keeps only the texture's light and dark, its grain. A
+    /// terrain without a colour map draws the texture either way.
+    pub texture_colour: f32,
 }
 
 impl TerrainMaterialSlot {
@@ -494,6 +530,7 @@ impl TerrainMaterialSlot {
             roughness: String::new(),
             perceptual_roughness: None,
             reflectance: None,
+            texture_colour: crate::texture_set::DEFAULT_TEXTURE_COLOUR,
         }
     }
 
@@ -510,6 +547,7 @@ impl TerrainMaterialSlot {
             roughness: String::new(),
             perceptual_roughness: None,
             reflectance: None,
+            texture_colour: crate::texture_set::DEFAULT_TEXTURE_COLOUR,
         }
     }
 
@@ -523,8 +561,14 @@ impl TerrainMaterialSlot {
     ///
     /// A NaN fails every comparison guarding it, including the shader's
     /// `strength <= 0.0`, so it would reach the sampler as a NaN UV. A tombstone
-    /// is left alone: its zeroed floats are what it is written back out as.
+    /// is left alone: its zeroed floats are what it is written back out as. The
+    /// texture colour is the one float it does not zero, so that one is clamped
+    /// for every slot.
     fn sanitize(&mut self) {
+        self.texture_colour = sane_unit(
+            self.texture_colour,
+            crate::texture_set::DEFAULT_TEXTURE_COLOUR,
+        );
         if self.is_tombstone() {
             return;
         }
@@ -570,8 +614,15 @@ pub const MIN_SLOPE_BAND_DEG: f32 = 0.5;
 const AUTOTERRAIN_BLOCK_LEN: usize = 12;
 /// Bytes the version-5 grid geometry block occupies.
 const GRID_BLOCK_LEN: usize = 12;
-/// Bytes the version-6 surface block occupies.
-const SURFACE_BLOCK_LEN: usize = 8;
+/// Bytes the surface block occupied from version 6 through 11: the blend
+/// sharpness and the tint strength.
+const SURFACE_BLOCK_LEN_V6: usize = 8;
+/// Bytes the version-12 surface block occupies: those two floats, then the
+/// near distance, the far distance, the relief depth and the grain.
+const SURFACE_BLOCK_LEN: usize = 24;
+/// Bytes the version-12 colour map block occupies ahead of any texels: the
+/// scale, three bytes of padding and the side.
+const COLOUR_MAP_HEADER_LEN: usize = 8;
 /// Bytes one version-7 placement record occupies: two indices and five
 /// floats.
 const PLACEMENT_LEN: usize = 24;
@@ -588,8 +639,10 @@ const AUTOTERRAIN_FLAG_ENABLED: u8 = 0b0000_0001;
 /// How a terrain's whole surface is shaded, over and above what any one slot
 /// says.
 ///
-/// Both fields are authored dials in `0..1`, defaulting to what every
-/// pre-version-6 sidecar was rendered at.
+/// The blend sharpness and the tint strength are authored dials in `0..1`,
+/// defaulting to what every pre-version-6 sidecar was rendered at. The four
+/// after them, from version 12, shape the near and far bands: how the ground
+/// looks close to the camera and how cheaply it is drawn far from it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceSettings {
     /// How hard the height blend cuts between two texture ids, `0..1`.
@@ -599,6 +652,22 @@ pub struct SurfaceSettings {
     /// How much of the colour layer reaches the albedo, `0..1`. 0 draws
     /// the textures untinted; 1 multiplies them by the painted colour.
     pub tint_strength: f32,
+    /// Distance from the camera, in metres, within which the ground gains its
+    /// near detail: parallax relief and grain, and a wider blend between the
+    /// planes of a cliff. The detail fades out over the next third of the
+    /// distance. 0 has no near band. `0..=`[`MAX_NEAR_DISTANCE`].
+    pub near_distance: f32,
+    /// Distance from the camera, in metres, past which the ground stops
+    /// reading its normal, occlusion and roughness maps and shades from each
+    /// slot's average instead. It fades in over the next third of the
+    /// distance. 0 has no far band. `0..=`[`MAX_FAR_DISTANCE`].
+    pub far_distance: f32,
+    /// How deep the near band's parallax relief reaches below the surface, in
+    /// metres. 0 is off. `0..=`[`MAX_RELIEF_DEPTH`].
+    pub relief_depth: f32,
+    /// How much of the textures' own grain the near band lays back over a
+    /// colour map, `0..1`. 0 is off.
+    pub grain: f32,
 }
 
 impl Default for SurfaceSettings {
@@ -606,6 +675,10 @@ impl Default for SurfaceSettings {
         Self {
             blend_sharpness: DEFAULT_BLEND_SHARPNESS,
             tint_strength: DEFAULT_TINT_STRENGTH,
+            near_distance: DEFAULT_NEAR_DISTANCE,
+            far_distance: DEFAULT_FAR_DISTANCE,
+            relief_depth: DEFAULT_RELIEF_DEPTH,
+            grain: DEFAULT_GRAIN,
         }
     }
 }
@@ -620,13 +693,18 @@ impl SurfaceSettings {
     }
 
     /// Clamp the block into the bounds the shader assumes: non-finite becomes
-    /// the field's default, out of range clamps to `0..=1`.
+    /// the field's default, out of range clamps to the field's own range.
     ///
     /// A NaN here would reach the shader as a NaN exponent or mix factor, which
     /// paints the terrain black.
     pub fn sanitize(&mut self) {
         self.blend_sharpness = sane_unit(self.blend_sharpness, DEFAULT_BLEND_SHARPNESS);
         self.tint_strength = sane_unit(self.tint_strength, DEFAULT_TINT_STRENGTH);
+        self.near_distance =
+            sane_up_to(self.near_distance, DEFAULT_NEAR_DISTANCE, MAX_NEAR_DISTANCE);
+        self.far_distance = sane_up_to(self.far_distance, DEFAULT_FAR_DISTANCE, MAX_FAR_DISTANCE);
+        self.relief_depth = sane_up_to(self.relief_depth, DEFAULT_RELIEF_DEPTH, MAX_RELIEF_DEPTH);
+        self.grain = sane_unit(self.grain, DEFAULT_GRAIN);
     }
 }
 
@@ -639,12 +717,159 @@ pub const DEFAULT_BLEND_SHARPNESS: f32 = 0.5;
 /// colour layer, which for an unpainted terrain is white and so no tint.
 pub const DEFAULT_TINT_STRENGTH: f32 = 1.0;
 
+/// Near distance a terrain shades at unless it says otherwise, in metres.
+pub const DEFAULT_NEAR_DISTANCE: f32 = 30.0;
+/// Farthest near distance a terrain may set, in metres.
+pub const MAX_NEAR_DISTANCE: f32 = 2000.0;
+
+/// Far distance a terrain shades at unless it says otherwise, in metres.
+pub const DEFAULT_FAR_DISTANCE: f32 = 150.0;
+/// Farthest far distance a terrain may set, in metres.
+pub const MAX_FAR_DISTANCE: f32 = 20000.0;
+
+/// Relief depth a terrain shades at unless it says otherwise: none.
+pub const DEFAULT_RELIEF_DEPTH: f32 = 0.0;
+/// Deepest relief a terrain may set, in metres. Deeper and the march through
+/// the height map shows its steps from any angle.
+pub const MAX_RELIEF_DEPTH: f32 = 0.5;
+
+/// Grain a terrain shades at unless it says otherwise: none.
+pub const DEFAULT_GRAIN: f32 = 0.0;
+
 /// A `0..1` dial, with non-finite falling back to `default`.
 fn sane_unit(value: f32, default: f32) -> f32 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
     } else {
         default
+    }
+}
+
+/// A `0..=max` dial, with non-finite falling back to `default`.
+fn sane_up_to(value: f32, default: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, max)
+    } else {
+        default
+    }
+}
+
+/// Most texels per grid cell a [`ColourMap`] may carry along each edge.
+pub const MAX_COLOUR_MAP_SCALE: u8 = 4;
+
+/// Most texels a [`ColourMap`] may carry along each edge. A 4096 by 4096 map
+/// is 64 MiB of RGBA8.
+pub const MAX_COLOUR_MAP_SIDE: u32 = 4096;
+
+/// Texels along one edge of the colour map a terrain of `control_resolution`
+/// grid points per edge carries at `scale` texels per grid cell.
+///
+/// Texel `j` sits at grid coordinate `j / scale`, so texel `scale * i` lies
+/// exactly on grid point `i` and the last texel on the last grid point. A
+/// resolution under 2 and a scale of 0 both give a single texel.
+#[must_use]
+pub fn side_for(control_resolution: u32, scale: u8) -> u32 {
+    u32::from(scale)
+        .saturating_mul(control_resolution.saturating_sub(1))
+        .saturating_add(1)
+}
+
+/// Why a [`ColourMap`] cannot be stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColourMapError {
+    /// A scale outside `1..=`[`MAX_COLOUR_MAP_SCALE`].
+    BadScale(u8),
+    /// A side of 0, or past [`MAX_COLOUR_MAP_SIDE`].
+    BadSide(u32),
+    /// The texel count is not `side * side`.
+    WrongTexelCount {
+        /// Texels the side calls for.
+        expected: usize,
+        /// Texels the map holds.
+        found: usize,
+    },
+}
+
+impl core::fmt::Display for ColourMapError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BadScale(scale) => write!(
+                f,
+                "colour map scale {scale} is outside 1..={MAX_COLOUR_MAP_SCALE}"
+            ),
+            Self::BadSide(side) => write!(
+                f,
+                "colour map side {side} is outside 1..={MAX_COLOUR_MAP_SIDE}"
+            ),
+            Self::WrongTexelCount { expected, found } => write!(
+                f,
+                "colour map holds {found} texels where its side calls for {expected}"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ColourMapError {}
+
+/// The colour of a whole terrain, baked outside the editor and carried beside
+/// the paint it was made for.
+///
+/// Where a terrain has one, the splat shader takes colour from here and uses
+/// the slot textures for their light and dark only, in the measure each slot's
+/// [`TerrainMaterialSlot::texture_colour`] says. It is sampled across the whole
+/// terrain at once, so it is far coarser than the textures it colours, and
+/// filtered rather than painted cell by cell.
+///
+/// Edits to the regions and the paint never touch it, and an edit that moves
+/// the grid leaves it where it was baked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColourMap {
+    /// Texels per grid cell along each edge, `1..=`[`MAX_COLOUR_MAP_SCALE`].
+    pub scale: u8,
+    /// Texels per edge: [`side_for`] the terrain's control resolution and
+    /// `scale`. At most [`MAX_COLOUR_MAP_SIDE`].
+    pub side: u32,
+    /// RGBA8, sRGB-encoded, row-major, `side * side` texels.
+    pub texels: Vec<[u8; 4]>,
+}
+
+impl ColourMap {
+    /// A colour map for a terrain of `control_resolution` grid points per
+    /// edge at `scale` texels per grid cell, with the side worked out from
+    /// both. Refuses a map whose scale, side or texel count the format
+    /// cannot store.
+    pub fn new(
+        control_resolution: u32,
+        scale: u8,
+        texels: Vec<[u8; 4]>,
+    ) -> Result<Self, ColourMapError> {
+        let map = Self {
+            scale,
+            side: side_for(control_resolution, scale),
+            texels,
+        };
+        map.validate()?;
+        Ok(map)
+    }
+
+    /// Check the map against what the format can store: a scale in
+    /// `1..=`[`MAX_COLOUR_MAP_SCALE`], a side in `1..=`[`MAX_COLOUR_MAP_SIDE`]
+    /// and exactly `side * side` texels.
+    pub fn validate(&self) -> Result<(), ColourMapError> {
+        if !(1..=MAX_COLOUR_MAP_SCALE).contains(&self.scale) {
+            return Err(ColourMapError::BadScale(self.scale));
+        }
+        if !(1..=MAX_COLOUR_MAP_SIDE).contains(&self.side) {
+            return Err(ColourMapError::BadSide(self.side));
+        }
+        let expected = (self.side as usize) * (self.side as usize);
+        if self.texels.len() != expected {
+            return Err(ColourMapError::WrongTexelCount {
+                expected,
+                found: self.texels.len(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -771,6 +996,9 @@ pub enum SidecarError {
     /// A placement named a palette or group index the file's own tables do
     /// not reach.
     UnknownScatterIndex,
+    /// A colour map declared a scale or side the format cannot store, or
+    /// holds a different number of texels than its side calls for.
+    InvalidColourMap(ColourMapError),
 }
 
 impl core::fmt::Display for SidecarError {
@@ -811,6 +1039,9 @@ impl core::fmt::Display for SidecarError {
                 f,
                 "terrain sidecar placement names a palette or group index the file does not declare"
             ),
+            Self::InvalidColourMap(reason) => {
+                write!(f, "terrain sidecar colour map is invalid: {reason}")
+            }
         }
     }
 }
@@ -1144,9 +1375,16 @@ pub struct RegionTerrainData {
     pub materials: Vec<TerrainMaterialSlot>,
     /// How the cells no hand has claimed are textured. Off by default.
     pub autoterrain: AutoTerrainSettings,
-    /// How the whole surface is shaded: blend sharpness and how much of
-    /// the colour layer reaches the albedo.
+    /// How the whole surface is shaded: blend sharpness, how much of the
+    /// colour layer reaches the albedo, and the near and far bands.
     pub surface: SurfaceSettings,
+    /// The baked colour of the whole terrain, or `None` for white: no colour
+    /// map, and every slot draws its own texture colour. `None` on every file
+    /// older than [`VERSION_12`].
+    ///
+    /// Edits to the regions and the paint never touch it; whoever rebuilds a
+    /// document from another carries it across.
+    pub colour_map: Option<ColourMap>,
     /// Where this document's cells sit in the world, or `None` when the file it
     /// came from is too old to state it.
     ///
@@ -1169,6 +1407,7 @@ impl Default for RegionTerrainData {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         }
@@ -1287,6 +1526,7 @@ impl RegionTerrainData {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             // Version 1 states no geometry, so its cells are placed by the
             // component's rectangle.
             grid: None,
@@ -1560,7 +1800,8 @@ impl RegionTerrainData {
                 .checked_add(4)?
                 .checked_add(slot.roughness.len())?
                 .checked_add(4)? // surface flags + padding
-                .checked_add(8)?; // roughness + reflectance
+                .checked_add(8)? // roughness + reflectance
+                .checked_add(4)?; // texture colour
         }
 
         for (_, region) in self.regions.iter_sorted() {
@@ -1581,6 +1822,10 @@ impl RegionTerrainData {
         len = len.checked_add(AUTOTERRAIN_BLOCK_LEN)?;
         len = len.checked_add(GRID_BLOCK_LEN)?;
         len = len.checked_add(SURFACE_BLOCK_LEN)?;
+        len = len.checked_add(COLOUR_MAP_HEADER_LEN)?;
+        if let Some(map) = &self.colour_map {
+            len = len.checked_add(map.texels.len().checked_mul(4)?)?;
+        }
 
         // Scatter palette block: two count-prefixed tables. Tombstoned
         // rows are not written, so they are not measured either.
@@ -1641,6 +1886,9 @@ pub fn encode_regions(data: &RegionTerrainData) -> Result<Vec<u8>, SidecarError>
             validate_scatter_group(key).map_err(SidecarError::InvalidScatterGroup)?;
         }
     }
+    if let Some(map) = &data.colour_map {
+        map.validate().map_err(SidecarError::InvalidColourMap)?;
+    }
     // Tombstoned rows are dropped on the way out and the surviving ones
     // renumbered, so a document stamped and cleared many times does not carry a
     // row per run. A placement's index is remapped with them.
@@ -1669,7 +1917,7 @@ pub fn encode_regions(data: &RegionTerrainData) -> Result<Vec<u8>, SidecarError>
     let mut out = Vec::with_capacity(data.encoded_len().ok_or(SidecarError::TooLarge)?);
 
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_11.to_le_bytes());
+    out.extend_from_slice(&VERSION_12.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&(data.channels.len() as u32).to_le_bytes());
     encode_channel_directory(&mut out, &data.channels);
@@ -1698,6 +1946,11 @@ pub fn encode_regions(data: &RegionTerrainData) -> Result<Vec<u8>, SidecarError>
         out.extend_from_slice(&[0u8; 3]);
         out.extend_from_slice(&slot.perceptual_roughness.unwrap_or(0.0).to_le_bytes());
         out.extend_from_slice(&slot.reflectance.unwrap_or(0.0).to_le_bytes());
+        let texture_colour = sane_unit(
+            slot.texture_colour,
+            crate::texture_set::DEFAULT_TEXTURE_COLOUR,
+        );
+        out.extend_from_slice(&texture_colour.to_le_bytes());
     }
 
     let mut autoterrain = data.autoterrain;
@@ -1720,8 +1973,33 @@ pub fn encode_regions(data: &RegionTerrainData) -> Result<Vec<u8>, SidecarError>
     out.extend_from_slice(&grid.anchor.y.to_le_bytes());
 
     let surface = data.surface.sanitized();
-    out.extend_from_slice(&surface.blend_sharpness.to_le_bytes());
-    out.extend_from_slice(&surface.tint_strength.to_le_bytes());
+    for dial in [
+        surface.blend_sharpness,
+        surface.tint_strength,
+        surface.near_distance,
+        surface.far_distance,
+        surface.relief_depth,
+        surface.grain,
+    ] {
+        out.extend_from_slice(&dial.to_le_bytes());
+    }
+
+    // No colour map writes a zero scale and a zero side and nothing after.
+    match &data.colour_map {
+        Some(map) => {
+            out.push(map.scale);
+            out.extend_from_slice(&[0u8; 3]);
+            out.extend_from_slice(&map.side.to_le_bytes());
+            for texel in &map.texels {
+                out.extend_from_slice(texel);
+            }
+        }
+        None => {
+            out.push(0);
+            out.extend_from_slice(&[0u8; 3]);
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
 
     out.extend_from_slice(&(assets.iter().flatten().count() as u32).to_le_bytes());
     for entry in data.scatter.assets.iter().filter(|e| !e.is_tombstone()) {
@@ -1815,7 +2093,7 @@ pub fn decode_regions(bytes: &[u8]) -> Result<RegionTerrainData, SidecarError> {
         return Err(SidecarError::BadMagic);
     }
     let version = r.u16()?;
-    if !(VERSION_2..=VERSION_11).contains(&version) {
+    if !(VERSION_2..=VERSION_12).contains(&version) {
         return Err(SidecarError::UnsupportedVersion(version));
     }
     if r.u16()? != 0 {
@@ -1895,6 +2173,13 @@ pub fn decode_regions(bytes: &[u8]) -> Result<RegionTerrainData, SidecarError> {
             perceptual_roughness = (flags & SLOT_FLAG_ROUGHNESS != 0).then_some(rough);
             reflectance = (flags & SLOT_FLAG_REFLECTANCE != 0).then_some(refl);
         }
+        // Versions 11 and older keep every slot's own texture colour.
+        let texture_colour = if version >= VERSION_12 {
+            let bytes = r.take(4)?;
+            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        } else {
+            crate::texture_set::DEFAULT_TEXTURE_COLOUR
+        };
         let mut slot = TerrainMaterialSlot {
             material,
             uv_scale,
@@ -1903,6 +2188,7 @@ pub fn decode_regions(bytes: &[u8]) -> Result<RegionTerrainData, SidecarError> {
             roughness,
             perceptual_roughness,
             reflectance,
+            texture_colour,
         };
         slot.sanitize();
         materials.push(slot);
@@ -1943,16 +2229,68 @@ pub fn decode_regions(bytes: &[u8]) -> Result<RegionTerrainData, SidecarError> {
     };
 
     // Versions 2 through 5 state no surface block: they were rendered at
-    // the defaults, which is what they load as.
+    // the defaults, which is what they load as. Versions 6 through 11 state
+    // the first two dials only, and keep the defaults of the four after them.
     let mut surface = SurfaceSettings::default();
     if version >= VERSION_6 {
-        let bytes = r.take(8)?;
+        let len = if version >= VERSION_12 {
+            SURFACE_BLOCK_LEN
+        } else {
+            SURFACE_BLOCK_LEN_V6
+        };
+        let bytes = r.take(len)?;
         let f = |i: usize| f32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
-        surface = SurfaceSettings {
-            blend_sharpness: f(0),
-            tint_strength: f(4),
+        surface.blend_sharpness = f(0);
+        surface.tint_strength = f(4);
+        if version >= VERSION_12 {
+            surface.near_distance = f(8);
+            surface.far_distance = f(12);
+            surface.relief_depth = f(16);
+            surface.grain = f(20);
         }
-        .sanitized();
+        surface.sanitize();
+    }
+
+    // Versions 11 and older carry no colour map.
+    let mut colour_map = None;
+    if version >= VERSION_12 {
+        let scale = r.u8()?;
+        if r.take(3)? != [0u8; 3] {
+            return Err(SidecarError::ReservedFieldSet);
+        }
+        let side = r.u32()?;
+        if scale == 0 {
+            // No map states no side; one that does means more than this
+            // build understands.
+            if side != 0 {
+                return Err(SidecarError::ReservedFieldSet);
+            }
+        } else {
+            // Checked before any texel is read, so a file claiming a huge map
+            // cannot make this reserve it.
+            if scale > MAX_COLOUR_MAP_SCALE {
+                return Err(SidecarError::InvalidColourMap(ColourMapError::BadScale(
+                    scale,
+                )));
+            }
+            if side == 0 || side > MAX_COLOUR_MAP_SIDE {
+                return Err(SidecarError::InvalidColourMap(ColourMapError::BadSide(
+                    side,
+                )));
+            }
+            let texels = (side as usize)
+                .checked_mul(side as usize)
+                .ok_or(SidecarError::TooLarge)?;
+            let texel_bytes = r.take(texels.checked_mul(4).ok_or(SidecarError::TooLarge)?)?;
+            colour_map = Some(ColourMap {
+                scale,
+                side,
+                texels: texel_bytes
+                    .chunks_exact(4)
+                    .map(|c| [c[0], c[1], c[2], c[3]])
+                    .collect(),
+            });
+        }
     }
 
     // Versions 2 through 6 carry their scatter as scene entities and
@@ -2148,6 +2486,7 @@ pub fn decode_regions(bytes: &[u8]) -> Result<RegionTerrainData, SidecarError> {
         materials,
         autoterrain,
         surface,
+        colour_map,
         grid,
         scatter,
     })
@@ -2196,7 +2535,7 @@ pub fn load_from(bytes: &[u8], assets: Option<&Path>) -> Result<LoadedSidecar, S
     let mut data = match version {
         0 => Err(SidecarError::UnsupportedVersion(0)),
         VERSION => decode(bytes).and_then(|legacy| RegionTerrainData::from_legacy_v1(&legacy)),
-        VERSION_2..=VERSION_11 => decode_regions(bytes),
+        VERSION_2..=VERSION_12 => decode_regions(bytes),
         other => Err(SidecarError::UnsupportedVersion(other)),
     }?;
     data.normalize();
@@ -2516,10 +2855,12 @@ mod tests {
                     roughness: String::new(),
                     perceptual_roughness: None,
                     reflectance: None,
+                    texture_colour: 1.0,
                 },
             ],
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         }
@@ -2550,6 +2891,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2559,6 +2901,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2575,6 +2918,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2590,6 +2934,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2608,6 +2953,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2637,6 +2983,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2796,7 +3143,7 @@ mod tests {
         migrated.grid = Some(GridGeometry::DEFAULT);
 
         let v2_bytes = save(&migrated).expect("encodes");
-        assert_eq!(u16::from_le_bytes([v2_bytes[8], v2_bytes[9]]), VERSION_11);
+        assert_eq!(u16::from_le_bytes([v2_bytes[8], v2_bytes[9]]), VERSION_12);
         assert_ne!(v2_bytes[8..10], v1_bytes[8..10]);
 
         let reloaded = load(&v2_bytes).expect("loads");
@@ -2842,6 +3189,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2865,6 +3213,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2886,6 +3235,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2903,27 +3253,69 @@ mod tests {
     fn rejects_a_v2_file_written_by_a_newer_build() {
         let bytes = encode_regions(&sample_regions()).expect("encodes");
         let mut newer = bytes.clone();
-        newer[8..10].copy_from_slice(&(VERSION_11 + 1).to_le_bytes());
+        newer[8..10].copy_from_slice(&(VERSION_12 + 1).to_le_bytes());
         assert_eq!(
             decode_regions(&newer),
-            Err(SidecarError::UnsupportedVersion(VERSION_11 + 1))
+            Err(SidecarError::UnsupportedVersion(VERSION_12 + 1))
         );
         assert_eq!(
             load(&newer),
-            Err(SidecarError::UnsupportedVersion(VERSION_11 + 1))
+            Err(SidecarError::UnsupportedVersion(VERSION_12 + 1))
         );
+    }
+
+    /// Where version 12's additions sit in this build's bytes for `data`: the
+    /// offset of each slot's texture colour, then the offset of the surface
+    /// block.
+    ///
+    /// Walks the slot block from a header with no channel directory in it,
+    /// which is every document these tests build.
+    fn version_12_offsets(data: &RegionTerrainData) -> (Vec<usize>, usize) {
+        assert!(data.channels.is_empty(), "the walk below assumes none");
+        let mut at = MAGIC.len() + 2 + 2 + 4 + 4 + 4 + 4;
+        // The texture colour is the last four bytes of a slot, behind the
+        // two map paths and the roughness and reflectance.
+        let mut colours = Vec::new();
+        for slot in &data.materials {
+            at += 4 + slot.material.len() + 4 + 4;
+            at += 4 + slot.occlusion.len() + 4 + slot.roughness.len();
+            at += 4 + 8;
+            colours.push(at);
+            at += 4;
+        }
+        (colours, at + AUTOTERRAIN_BLOCK_LEN + GRID_BLOCK_LEN)
+    }
+
+    /// Version 11 lays the same bytes out but for what version 12 added: the
+    /// texture colour each slot ends with, the four dials after the surface
+    /// block's first two, and the colour map block behind it. So a version-11
+    /// file is this build's bytes with those dropped and under the older
+    /// version word, and every older layout below starts from this one.
+    fn version_11_bytes(data: &RegionTerrainData) -> Vec<u8> {
+        assert!(
+            data.colour_map.is_none(),
+            "a version-11 file has nowhere to put a colour map"
+        );
+        let mut bytes = encode_regions(data).expect("encodes");
+        let (colours, surface) = version_12_offsets(data);
+        // The first 8 bytes of the surface block are version 6's; what
+        // version 12 added runs on from there into the colour map header.
+        bytes.drain(
+            surface + SURFACE_BLOCK_LEN_V6..surface + SURFACE_BLOCK_LEN + COLOUR_MAP_HEADER_LEN,
+        );
+        for colour in colours.into_iter().rev() {
+            bytes.drain(colour..colour + 4);
+        }
+        bytes[8..10].copy_from_slice(&VERSION_11.to_le_bytes());
+        bytes
     }
 
     /// Version 7 lays the same bytes out but for the occlusion and roughness
     /// paths and the surface block a slot ends with now, so a version-7 file
-    /// is this build's bytes with those dropped and under the older version
+    /// is the version-11 bytes with those dropped and under the older version
     /// word.
-    ///
-    /// Walks the slot block from a header with no channel directory in it,
-    /// which is every document these tests build.
     fn version_7_bytes(data: &RegionTerrainData) -> Vec<u8> {
-        assert!(data.channels.is_empty(), "the walk below assumes none");
-        let mut bytes = encode_regions(data).expect("encodes");
+        let mut bytes = version_11_bytes(data);
         let mut at = MAGIC.len() + 2 + 2 + 4 + 4 + 4 + 4;
         for slot in &data.materials {
             at += 4 + slot.material.len() + 4 + 4;
@@ -2969,7 +3361,7 @@ mod tests {
         let loaded = load_from(&bytes, Some(assets.path())).expect("loads");
         let forward = save(&loaded.data).expect("encodes");
 
-        assert_eq!(u16::from_le_bytes([forward[8], forward[9]]), VERSION_11);
+        assert_eq!(u16::from_le_bytes([forward[8], forward[9]]), VERSION_12);
         assert_eq!(
             load(&forward).expect("reloads").materials[0].material,
             "materials/grass.material.bsn",
@@ -3007,7 +3399,7 @@ mod tests {
         );
         assert_eq!(
             decode(&regions_bytes),
-            Err(SidecarError::UnsupportedVersion(VERSION_11))
+            Err(SidecarError::UnsupportedVersion(VERSION_12))
         );
     }
 
@@ -3037,6 +3429,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3058,6 +3451,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3081,6 +3475,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3095,6 +3490,7 @@ mod tests {
             + AUTOTERRAIN_BLOCK_LEN
             + GRID_BLOCK_LEN
             + SURFACE_BLOCK_LEN
+            + COLOUR_MAP_HEADER_LEN
             + EMPTY_SCATTER_BLOCK_LEN;
         let word = u32::from_le_bytes([
             bytes[control_offset],
@@ -3132,6 +3528,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3143,6 +3540,7 @@ mod tests {
             + AUTOTERRAIN_BLOCK_LEN
             + GRID_BLOCK_LEN
             + SURFACE_BLOCK_LEN
+            + COLOUR_MAP_HEADER_LEN
             + EMPTY_SCATTER_BLOCK_LEN;
         let mut poisoned = bytes.clone();
         poisoned[flags_offset] |= 0b1000_0000;
@@ -3164,6 +3562,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3172,6 +3571,7 @@ mod tests {
             + AUTOTERRAIN_BLOCK_LEN
             + GRID_BLOCK_LEN
             + SURFACE_BLOCK_LEN
+            + COLOUR_MAP_HEADER_LEN
             + EMPTY_SCATTER_BLOCK_LEN;
         let mut poisoned = bytes.clone();
         assert_eq!(poisoned[flags_offset], REGION_FLAG_PRESENT);
@@ -3192,6 +3592,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3201,6 +3602,7 @@ mod tests {
             + AUTOTERRAIN_BLOCK_LEN
             + GRID_BLOCK_LEN
             + SURFACE_BLOCK_LEN
+            + COLOUR_MAP_HEADER_LEN
             + EMPTY_SCATTER_BLOCK_LEN;
         let mut poisoned = bytes.clone();
         poisoned[pad_offset] = 1;
@@ -3218,6 +3620,7 @@ mod tests {
             materials: vec![TerrainMaterialSlot::new("../escape")],
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3300,6 +3703,7 @@ mod tests {
             ],
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3405,7 +3809,7 @@ mod tests {
             materials: vec![TerrainMaterialSlot::new("grass")],
             ..RegionTerrainData::default()
         };
-        let current = encode_regions(&data).expect("encodes");
+        let current = version_11_bytes(&data);
 
         // Version 8 lays out the same bytes without the two path fields and
         // the surface block a slot now ends with, so dropping those from the
@@ -3442,7 +3846,7 @@ mod tests {
             },
             ..RegionTerrainData::default()
         };
-        let current = encode_regions(&data).expect("encodes");
+        let current = version_11_bytes(&data);
 
         let header = MAGIC.len() + 2 + 2 + 4 + 4 + 4 + 4;
         let surface = header + 4 + "grass".len() + 4 + 4 + 4 + 4;
@@ -3513,6 +3917,358 @@ mod tests {
         assert_eq!(back.materials, data.materials);
     }
 
+    /// A file written before the near and far bands, the colour map and the
+    /// texture colour loads at their defaults, and keeps everything it did
+    /// say: the slot surface version 11 introduced and the two surface dials
+    /// version 6 did.
+    #[test]
+    fn a_version_11_file_loads_with_the_version_12_defaults() {
+        let data = RegionTerrainData {
+            materials: vec![
+                TerrainMaterialSlot {
+                    perceptual_roughness: Some(0.35),
+                    ..TerrainMaterialSlot::new("wet_rock")
+                },
+                TerrainMaterialSlot::tombstone(),
+                TerrainMaterialSlot::new("grass"),
+            ],
+            surface: SurfaceSettings {
+                blend_sharpness: 0.75,
+                tint_strength: 0.25,
+                ..SurfaceSettings::default()
+            },
+            ..RegionTerrainData::default()
+        };
+        let older = version_11_bytes(&data);
+        assert_eq!(u16::from_le_bytes([older[8], older[9]]), VERSION_11);
+
+        for decoded in [
+            decode_regions(&older).expect("a version-11 file still decodes"),
+            load(&older).expect("and loads"),
+        ] {
+            assert_eq!(decoded, data);
+            assert_eq!(decoded.surface.blend_sharpness, 0.75);
+            assert_eq!(decoded.surface.near_distance, 30.0);
+            assert_eq!(decoded.surface.far_distance, 150.0);
+            assert_eq!(decoded.surface.relief_depth, 0.0);
+            assert_eq!(decoded.surface.grain, 0.0);
+            assert_eq!(decoded.colour_map, None);
+            assert!(decoded.materials.iter().all(|s| s.texture_colour == 1.0));
+            assert_eq!(decoded.materials[0].perceptual_roughness, Some(0.35));
+        }
+
+        // Saving it forward writes the current version and reads back the same.
+        let decoded = load(&older).expect("loads");
+        let forward = save(&decoded).expect("encodes");
+        assert_eq!(u16::from_le_bytes([forward[8], forward[9]]), VERSION_12);
+        assert_eq!(load(&forward).expect("reloads"), decoded);
+    }
+
+    /// Everything version 12 carries survives the round trip at full
+    /// precision, and a second save is the same bytes as the first.
+    #[test]
+    fn version_12_round_trips_the_colour_map_the_dials_and_each_slots_texture_colour() {
+        let side = side_for(4, 2);
+        assert_eq!(side, 7);
+        let texels = (0..side * side)
+            .map(|i| [i as u8, (i * 3) as u8, 255 - i as u8, 255])
+            .collect();
+        let data = RegionTerrainData {
+            materials: vec![
+                TerrainMaterialSlot {
+                    texture_colour: 0.25,
+                    ..TerrainMaterialSlot::new("grass")
+                },
+                TerrainMaterialSlot {
+                    texture_colour: 0.0,
+                    ..TerrainMaterialSlot::new("rock")
+                },
+                TerrainMaterialSlot::tombstone(),
+            ],
+            surface: SurfaceSettings {
+                blend_sharpness: 0.875,
+                tint_strength: 0.25,
+                near_distance: 45.5,
+                far_distance: 300.0,
+                relief_depth: 0.125,
+                grain: 0.5,
+            },
+            colour_map: Some(ColourMap::new(4, 2, texels).expect("a map the format can hold")),
+            ..RegionTerrainData::default()
+        };
+
+        let bytes = save(&data).expect("encodes");
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), VERSION_12);
+        assert_eq!(bytes.len(), data.encoded_len().expect("fits"));
+        let back = load(&bytes).expect("loads");
+        assert_eq!(back, data);
+        assert_eq!(back.materials[0].texture_colour, 0.25);
+        assert_eq!(back.materials[1].texture_colour, 0.0);
+        let map = back.colour_map.as_ref().expect("the map comes back");
+        assert_eq!((map.scale, map.side), (2, 7));
+        assert_eq!(map.texels[10], [10, 30, 245, 255]);
+        assert_eq!(save(&back).expect("encodes again"), bytes);
+    }
+
+    /// The colour map block sits right behind the surface block, so a document
+    /// with nothing before it has it at a fixed offset.
+    const EMPTY_DOC_COLOUR_MAP_OFFSET: usize =
+        EMPTY_DOC_GRID_OFFSET + GRID_BLOCK_LEN + SURFACE_BLOCK_LEN;
+
+    /// A scale, a side or padding the format cannot hold is refused at the
+    /// header, before the texels are looked for.
+    #[test]
+    fn a_colour_map_header_the_format_cannot_hold_is_rejected() {
+        let data = RegionTerrainData {
+            colour_map: Some(ColourMap::new(2, 1, vec![[7; 4]; 4]).expect("a 2 by 2 map")),
+            ..RegionTerrainData::default()
+        };
+        let good = encode_regions(&data).expect("encodes");
+        let at = EMPTY_DOC_COLOUR_MAP_OFFSET;
+        assert_eq!(
+            decode_regions(&good).expect("decodes"),
+            data,
+            "offset math must match the encoder"
+        );
+        let poisoned = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut bytes = good.clone();
+            edit(&mut bytes);
+            decode_regions(&bytes)
+        };
+        let set_side = |bytes: &mut Vec<u8>, side: u32| {
+            bytes[at + 4..at + 8].copy_from_slice(&side.to_le_bytes());
+        };
+
+        for scale in [5u8, 200] {
+            assert_eq!(
+                poisoned(&|b| b[at] = scale),
+                Err(SidecarError::InvalidColourMap(ColourMapError::BadScale(
+                    scale
+                )))
+            );
+        }
+        for side in [0u32, 4097, u32::MAX] {
+            assert_eq!(
+                poisoned(&|b| set_side(b, side)),
+                Err(SidecarError::InvalidColourMap(ColourMapError::BadSide(
+                    side
+                )))
+            );
+        }
+        for padding in 1..4 {
+            assert_eq!(
+                poisoned(&|b| b[at + padding] = 1),
+                Err(SidecarError::ReservedFieldSet)
+            );
+        }
+        // The largest side is allowed, and then the file is simply too short
+        // for it.
+        assert_eq!(
+            poisoned(&|b| set_side(b, MAX_COLOUR_MAP_SIDE)),
+            Err(SidecarError::Truncated)
+        );
+        // No map states no side.
+        let mut none = encode_regions(&RegionTerrainData::default()).expect("encodes");
+        none[at + 4..at + 8].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(decode_regions(&none), Err(SidecarError::ReservedFieldSet));
+        // Texels short of the side, and bytes past the last one.
+        assert_eq!(
+            decode_regions(&good[..at + COLOUR_MAP_HEADER_LEN + 15]),
+            Err(SidecarError::Truncated)
+        );
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(decode_regions(&long), Err(SidecarError::Truncated));
+    }
+
+    /// The writer holds a map to the same limits the reader does.
+    #[test]
+    fn encode_refuses_a_colour_map_the_reader_would_refuse() {
+        let texels = |n: usize| vec![[0u8; 4]; n];
+        for (map, want) in [
+            (
+                ColourMap {
+                    scale: 0,
+                    side: 2,
+                    texels: texels(4),
+                },
+                ColourMapError::BadScale(0),
+            ),
+            (
+                ColourMap {
+                    scale: 5,
+                    side: 2,
+                    texels: texels(4),
+                },
+                ColourMapError::BadScale(5),
+            ),
+            (
+                ColourMap {
+                    scale: 1,
+                    side: 0,
+                    texels: texels(0),
+                },
+                ColourMapError::BadSide(0),
+            ),
+            (
+                ColourMap {
+                    scale: 1,
+                    side: MAX_COLOUR_MAP_SIDE + 1,
+                    texels: texels(4),
+                },
+                ColourMapError::BadSide(MAX_COLOUR_MAP_SIDE + 1),
+            ),
+            (
+                ColourMap {
+                    scale: 1,
+                    side: 2,
+                    texels: texels(3),
+                },
+                ColourMapError::WrongTexelCount {
+                    expected: 4,
+                    found: 3,
+                },
+            ),
+        ] {
+            let data = RegionTerrainData {
+                colour_map: Some(map),
+                ..RegionTerrainData::default()
+            };
+            assert_eq!(
+                encode_regions(&data),
+                Err(SidecarError::InvalidColourMap(want))
+            );
+        }
+    }
+
+    /// Texel `j` of a colour map sits at grid coordinate `j / scale`, so the
+    /// first texel is on the first grid point, the last on the last, and every
+    /// `scale`th between them on the grid point it is a multiple of.
+    #[test]
+    fn side_for_puts_a_colour_map_texel_on_every_grid_point() {
+        assert_eq!(side_for(257, 1), 257);
+        assert_eq!(side_for(257, 2), 513);
+        assert_eq!(side_for(257, 4), 1025);
+        assert_eq!(side_for(2, 4), 5);
+        for scale in 1..=MAX_COLOUR_MAP_SCALE {
+            for resolution in [2u32, 3, 17, 257] {
+                assert_eq!(
+                    side_for(resolution, scale) - 1,
+                    u32::from(scale) * (resolution - 1),
+                    "scale {scale} at {resolution} grid points"
+                );
+            }
+        }
+        // No grid, one grid point, or no scale, is a single texel; and a
+        // resolution from a hostile file saturates rather than wrapping.
+        assert_eq!(side_for(0, 4), 1);
+        assert_eq!(side_for(1, 4), 1);
+        assert_eq!(side_for(9, 0), 1);
+        assert_eq!(side_for(u32::MAX, 4), u32::MAX);
+    }
+
+    /// The constructor works the side out from the grid, and holds the texels
+    /// to it.
+    #[test]
+    fn a_colour_map_is_built_for_a_grid_and_held_to_its_side() {
+        let map = ColourMap::new(3, 2, vec![[1, 2, 3, 4]; 25]).expect("5 by 5 texels");
+        assert_eq!((map.scale, map.side), (2, 5));
+        assert_eq!(
+            ColourMap::new(3, 2, vec![[1, 2, 3, 4]; 24]),
+            Err(ColourMapError::WrongTexelCount {
+                expected: 25,
+                found: 24
+            })
+        );
+        assert_eq!(
+            ColourMap::new(3, 0, vec![[0; 4]]),
+            Err(ColourMapError::BadScale(0))
+        );
+        assert_eq!(
+            ColourMap::new(3000, 4, Vec::new()),
+            Err(ColourMapError::BadSide(side_for(3000, 4)))
+        );
+    }
+
+    /// Sanitized like the rest of the surface block and the other slot floats:
+    /// a NaN distance reaches a `smoothstep` the fragment cannot guard, and a
+    /// NaN texture colour its `mix`.
+    #[test]
+    fn corrupt_version_12_floats_decode_to_sanitized_values() {
+        let data = RegionTerrainData {
+            materials: vec![
+                TerrainMaterialSlot::new("g"),
+                TerrainMaterialSlot::tombstone(),
+            ],
+            ..RegionTerrainData::default()
+        };
+        let good = encode_regions(&data).expect("encodes");
+        let (colours, surface) = version_12_offsets(&data);
+        assert_eq!(
+            decode_regions(&good).expect("decodes"),
+            data,
+            "offset math must match the encoder"
+        );
+        let dials = surface + SURFACE_BLOCK_LEN_V6;
+
+        let decoded = |value: f32| {
+            let mut bytes = good.clone();
+            for at in colours
+                .iter()
+                .copied()
+                .chain((0..4).map(|dial| dials + dial * 4))
+            {
+                bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            decode_regions(&bytes).expect("decodes")
+        };
+        let surface_of = |value: f32| {
+            let s = decoded(value).surface;
+            (s.near_distance, s.far_distance, s.relief_depth, s.grain)
+        };
+
+        assert_eq!(surface_of(f32::NAN), (30.0, 150.0, 0.0, 0.0));
+        assert_eq!(surface_of(f32::INFINITY), (30.0, 150.0, 0.0, 0.0));
+        assert_eq!(surface_of(-5.0), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(surface_of(1e9), (2000.0, 20000.0, 0.5, 1.0));
+        assert_eq!(surface_of(0.25), (0.25, 0.25, 0.25, 0.25));
+
+        for (value, want) in [(f32::NAN, 1.0), (9.0, 1.0), (-1.0, 0.0), (0.5, 0.5)] {
+            assert_eq!(decoded(value).materials[0].texture_colour, want);
+        }
+        assert_eq!(
+            decoded(f32::NAN).materials[1],
+            TerrainMaterialSlot::tombstone(),
+            "a tombstone's texture colour is clamped like any slot's, and is not zeroed"
+        );
+    }
+
+    /// The writer clamps the dials it is handed, so a document that never went
+    /// through a decode still cannot put a NaN in the file.
+    #[test]
+    fn the_writer_sanitizes_the_version_12_dials_and_the_texture_colour() {
+        let data = RegionTerrainData {
+            materials: vec![TerrainMaterialSlot {
+                texture_colour: f32::NAN,
+                ..TerrainMaterialSlot::new("g")
+            }],
+            surface: SurfaceSettings {
+                near_distance: f32::NAN,
+                far_distance: 1e9,
+                relief_depth: -1.0,
+                grain: 7.0,
+                ..SurfaceSettings::default()
+            },
+            ..RegionTerrainData::default()
+        };
+        let back = load(&save(&data).expect("encodes")).expect("decodes");
+        assert_eq!(back.materials[0].texture_colour, 1.0);
+        assert_eq!(back.surface.near_distance, DEFAULT_NEAR_DISTANCE);
+        assert_eq!(back.surface.far_distance, MAX_FAR_DISTANCE);
+        assert_eq!(back.surface.relief_depth, 0.0);
+        assert_eq!(back.surface.grain, 1.0);
+    }
+
     /// A version-3 file has no autoterrain block and loads with
     /// autoterrain off. Saving it forward writes the block at its
     /// defaults.
@@ -3538,7 +4294,7 @@ mod tests {
         assert_eq!(decoded.materials[0].detile, 0.5);
 
         let forward = save(&decoded).expect("encodes");
-        assert_eq!(u16::from_le_bytes([forward[8], forward[9]]), VERSION_11);
+        assert_eq!(u16::from_le_bytes([forward[8], forward[9]]), VERSION_12);
         assert_eq!(
             load(&forward).expect("reloads").autoterrain,
             decoded.autoterrain
@@ -3582,6 +4338,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         }
@@ -3627,7 +4384,7 @@ mod tests {
         });
 
         let bytes = encode_regions(&data).expect("encodes");
-        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), VERSION_11);
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), VERSION_12);
         assert_eq!(decode_regions(&bytes).expect("decodes"), data);
         assert_eq!(load(&bytes).expect("loads"), data);
     }
@@ -3668,6 +4425,7 @@ mod tests {
                 ..EMPTY_DOC_GRID_OFFSET
                     + GRID_BLOCK_LEN
                     + SURFACE_BLOCK_LEN
+                    + COLOUR_MAP_HEADER_LEN
                     + EMPTY_SCATTER_BLOCK_LEN,
             [],
         );
@@ -3725,7 +4483,7 @@ mod tests {
     fn a_scatter_palette_and_its_placements_round_trip() {
         let data = scattered_document();
         let bytes = save(&data).expect("encodes");
-        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), VERSION_11);
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), VERSION_12);
         assert_eq!(bytes.len(), data.encoded_len().expect("fits"));
         assert_eq!(load(&bytes).expect("loads"), data);
     }
@@ -3740,7 +4498,7 @@ mod tests {
         // Saving it forward writes the empty palette and one zero
         // placement count per region, and reads back the same document.
         let forward = save(&data).expect("encodes");
-        assert_eq!(u16::from_le_bytes([forward[8], forward[9]]), VERSION_11);
+        assert_eq!(u16::from_le_bytes([forward[8], forward[9]]), VERSION_12);
         assert_eq!(load(&forward).expect("loads"), data);
     }
 
@@ -3922,7 +4680,7 @@ mod tests {
         let data = load(VERSION_5_FILE).expect("loads");
         let forward = save(&data).expect("encodes");
 
-        assert_eq!(u16::from_le_bytes([forward[8], forward[9]]), VERSION_11);
+        assert_eq!(u16::from_le_bytes([forward[8], forward[9]]), VERSION_12);
         assert_eq!(load(&forward).expect("reloads"), data);
     }
 
@@ -3932,12 +4690,13 @@ mod tests {
             surface: SurfaceSettings {
                 blend_sharpness: 0.875,
                 tint_strength: 0.25,
+                ..SurfaceSettings::default()
             },
             ..RegionTerrainData::default()
         };
 
         let bytes = save(&data).expect("encodes");
-        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), VERSION_11);
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), VERSION_12);
         let back = load(&bytes).expect("decodes");
         assert_eq!(back.surface, data.surface);
         assert_eq!(back, data);
@@ -3952,6 +4711,7 @@ mod tests {
             surface: SurfaceSettings {
                 blend_sharpness: f32::NAN,
                 tint_strength: 4.0,
+                ..SurfaceSettings::default()
             },
             ..RegionTerrainData::default()
         };
@@ -4210,6 +4970,7 @@ mod tests {
                     roughness: String::new(),
                     perceptual_roughness: None,
                     reflectance: None,
+                    texture_colour: 1.0,
                 },
                 TerrainMaterialSlot {
                     material: "rock".to_string(),
@@ -4219,6 +4980,7 @@ mod tests {
                     roughness: String::new(),
                     perceptual_roughness: None,
                     reflectance: None,
+                    texture_colour: 1.0,
                 },
                 TerrainMaterialSlot::tombstone(),
             ],
@@ -4243,11 +5005,13 @@ mod tests {
             roughness: String::new(),
             perceptual_roughness: None,
             reflectance: None,
+            texture_colour: 1.0,
         };
         let data = RegionTerrainData {
             materials: vec![slot(0.25, 0.5), TerrainMaterialSlot::tombstone()],
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
             ..RegionTerrainData::default()
@@ -4318,6 +5082,12 @@ mod tests {
             ],
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            // A 2 by 2 colour map, so the texels are a boundary walked too.
+            colour_map: Some(ColourMap {
+                scale: 1,
+                side: 2,
+                texels: vec![[1, 2, 3, 4]; 4],
+            }),
             grid: Some(GridGeometry::DEFAULT),
             // One palette entry, one group key and one placement below,
             // so the version-7 boundaries are walked too.
@@ -4361,14 +5131,16 @@ mod tests {
         let slot_pad_end = slot_flags_end + 3;
         let slot_roughness_end = slot_pad_end + 4;
         let slot_reflectance_end = slot_roughness_end + 4;
+        let slot_texture_colour_end = slot_reflectance_end + 4;
         // The tombstone writes a zero length and no name bytes at all.
-        let tomb_name_len_end = slot_reflectance_end + 4;
+        let tomb_name_len_end = slot_texture_colour_end + 4;
         let tomb_uv_scale_end = tomb_name_len_end + 4;
         let tomb_detile_end = tomb_uv_scale_end + 4;
         let tomb_occlusion_end = tomb_detile_end + 4;
         let tomb_roughness_end = tomb_occlusion_end + 4;
         let tomb_surface_end = tomb_roughness_end + 12;
-        let auto_flags_end = tomb_surface_end + 1;
+        let tomb_texture_colour_end = tomb_surface_end + 4;
+        let auto_flags_end = tomb_texture_colour_end + 1;
         let auto_base_end = auto_flags_end + 1;
         let auto_slope_end = auto_base_end + 1;
         let auto_pad_end = auto_slope_end + 1;
@@ -4379,7 +5151,15 @@ mod tests {
         let grid_anchor_z_end = grid_anchor_x_end + 4;
         let surface_sharpness_end = grid_anchor_z_end + 4;
         let surface_tint_end = surface_sharpness_end + 4;
-        let asset_count_end = surface_tint_end + 4;
+        let surface_near_end = surface_tint_end + 4;
+        let surface_far_end = surface_near_end + 4;
+        let surface_relief_end = surface_far_end + 4;
+        let surface_grain_end = surface_relief_end + 4;
+        let colour_scale_end = surface_grain_end + 1;
+        let colour_pad_end = colour_scale_end + 3;
+        let colour_side_end = colour_pad_end + 4;
+        let colour_texels_end = colour_side_end + 4 * 4; // 4 texels * 4 bytes
+        let asset_count_end = colour_texels_end + 4;
         let asset_len_end = asset_count_end + 4;
         let asset_name_end = asset_len_end + 5; // "a.glb"
         let asset_flags_end = asset_name_end + 1;
@@ -4426,12 +5206,14 @@ mod tests {
             slot_pad_end,
             slot_roughness_end,
             slot_reflectance_end,
+            slot_texture_colour_end,
             tomb_name_len_end,
             tomb_uv_scale_end,
             tomb_detile_end,
             tomb_occlusion_end,
             tomb_roughness_end,
             tomb_surface_end,
+            tomb_texture_colour_end,
             auto_flags_end,
             auto_base_end,
             auto_slope_end,
@@ -4443,6 +5225,14 @@ mod tests {
             grid_anchor_z_end,
             surface_sharpness_end,
             surface_tint_end,
+            surface_near_end,
+            surface_far_end,
+            surface_relief_end,
+            surface_grain_end,
+            colour_scale_end,
+            colour_pad_end,
+            colour_side_end,
+            colour_texels_end,
             asset_count_end,
             asset_len_end,
             asset_name_end,
@@ -4482,6 +5272,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -4528,6 +5319,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -4555,6 +5347,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -4575,6 +5368,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -4586,6 +5380,7 @@ mod tests {
             + AUTOTERRAIN_BLOCK_LEN
             + GRID_BLOCK_LEN
             + SURFACE_BLOCK_LEN
+            + COLOUR_MAP_HEADER_LEN
             + EMPTY_SCATTER_BLOCK_LEN..]
             .to_vec();
         let mut poisoned = bytes.clone();
@@ -4678,6 +5473,7 @@ mod tests {
             materials: Vec::new(),
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
+            colour_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };

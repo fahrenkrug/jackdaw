@@ -1210,6 +1210,7 @@ mod resolve_tests {
                 roughness: String::new(),
                 perceptual_roughness: None,
                 reflectance: None,
+                texture_colour: 1.0,
             }],
         );
 
@@ -2576,6 +2577,7 @@ mod tests {
         material.set_surface(SurfaceSettings {
             blend_sharpness: 0.25,
             tint_strength: 0.0,
+            ..SurfaceSettings::default()
         });
         assert_eq!(material.tint_strength, 0.0);
         assert_eq!(material.blend_sharpness, 0.25);
@@ -2640,6 +2642,7 @@ mod tests {
             SurfaceSettings {
                 blend_sharpness: f32::NAN,
                 tint_strength: 9.0,
+                ..SurfaceSettings::default()
             },
         );
         assert_eq!(material.blend_sharpness, DEFAULT_BLEND_SHARPNESS);

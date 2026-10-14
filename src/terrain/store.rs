@@ -2398,6 +2398,7 @@ mod tests {
                     roughness: String::new(),
                     perceptual_roughness: None,
                     reflectance: None,
+                    texture_colour: 1.0,
                 }],
             )
             .expect("accepted");

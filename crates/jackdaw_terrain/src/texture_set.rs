@@ -52,6 +52,11 @@ pub const MAX_SLOT_ROUGHNESS: f32 = 2.0;
 /// `StandardMaterial`'s default, 4% at normal incidence.
 pub const DEFAULT_REFLECTANCE: f32 = 0.5;
 
+/// How much of its own texture colour a slot keeps when the terrain carries a
+/// colour map and the slot says nothing: all of it, which is how a terrain
+/// without a colour map has always drawn.
+pub const DEFAULT_TEXTURE_COLOUR: f32 = 1.0;
+
 /// Strongest detiling a slot may declare. Past a full turn of rotation
 /// and a whole tile of offset there is nothing further to break up.
 pub const MAX_DETILE: f32 = 1.0;

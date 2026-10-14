@@ -58,8 +58,8 @@ pub use rect::GridRect;
 pub use region::{Region, RegionCoord, RegionSize, RegionSizeError, TerrainRegions};
 pub use scatter::{Placement, ScatterMask, ScatterParams, scatter};
 pub use sidecar::{
-    AutoTerrainSettings, GridGeometry, GridShape, RegionTerrainData, SidecarError, SurfaceSettings,
-    TerrainData,
+    AutoTerrainSettings, ColourMap, ColourMapError, GridGeometry, GridShape, RegionTerrainData,
+    SidecarError, SurfaceSettings, TerrainData,
 };
 pub use splat::{
     ControlTexels, control_cell, control_corner, grid_uv, layers_covered, write_control_rect,
