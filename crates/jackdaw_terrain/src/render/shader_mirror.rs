@@ -88,15 +88,18 @@ pub(super) fn top_frame(normal: Vec3) -> Mat3 {
 }
 
 /// What the shader makes of one plane's tangent-space normal `tangent` (unpacked
-/// from the texture, Z out of the plane) over a surface whose world normal is
+/// from the texture, Z out of the plane) over a surface whose normal is
 /// `surface`, before the planes are summed and normalised.
 ///
-/// The top plane takes the frame above. The side planes have no frame, so they
-/// take a whiteout blend (Ben Golus, "Normal Mapping for a Triplanar Shader"):
-/// the tangent normal is added to the surface normal swizzled into the plane's
-/// own axes, then swizzled back. This shader's tangent Y follows +V, and on a
-/// side plane V runs down the world, so it is world -Y: flipped first, so the
-/// same bump reads the same on every plane.
+/// The top plane takes the frame above, built in world axes, so for it `surface`
+/// and the result are in world space. The side planes have no frame, so they take
+/// a whiteout blend (Ben Golus, "Normal Mapping for a Triplanar Shader"): the
+/// tangent normal is added to the surface normal swizzled into the plane's own
+/// axes, then swizzled back. The planes are the terrain's own axes, so for them
+/// `surface` and the result are in the terrain's space, and [`side_plane_world`]
+/// is what turns the result into world axes. This shader's tangent Y follows +V,
+/// and on a side plane V runs down the terrain, so it is terrain -Y: flipped
+/// first, so the same bump reads the same on every plane.
 pub(super) fn plane_world_normal(plane: Plane, tangent: Vec3, surface: Vec3) -> Vec3 {
     let flipped = Vec3::new(tangent.x, -tangent.y, tangent.z);
     match plane {
@@ -115,6 +118,19 @@ pub(super) fn plane_world_normal(plane: Plane, tangent: Vec3, surface: Vec3) -> 
             flipped.z.abs() * surface.z,
         ),
     }
+}
+
+/// A side plane's normal in world axes, for a terrain turned by `rotation` (a
+/// rotation, so its own inverse transpose): the whiteout blend in the terrain's
+/// space over `local_surface`, turned into world axes with the length it had.
+pub(super) fn side_plane_world(
+    plane: Plane,
+    tangent: Vec3,
+    local_surface: Vec3,
+    rotation: Mat3,
+) -> Vec3 {
+    let local = plane_world_normal(plane, tangent, local_surface);
+    (rotation * local).normalize_or_zero() * local.length()
 }
 
 /// The near and far bands at `distance` metres from the eye, as the shader
@@ -294,22 +310,49 @@ mod tests {
             for plane in [Plane::X, Plane::Z] {
                 let world = plane_world_normal(plane, flat, surface);
                 assert!(
-                    world.abs_diff_eq(surface, 1e-6) || {
-                        // The plane that faces the other axis reads the other
-                        // component as its normal; only the plane the surface
-                        // leans on is exact. The other keeps the lean in-plane.
-                        true
-                    },
+                    world.abs_diff_eq(surface, 1e-6),
                     "{plane:?} over {surface}: {world}"
                 );
             }
         }
-        // The plane a surface faces is exact.
-        for (plane, surface) in [
-            (Plane::X, Vec3::new(0.8, 0.6, 0.0)),
-            (Plane::Z, Vec3::new(0.0, 0.6, 0.8)),
+    }
+
+    /// A terrain turned about Y has its cliffs' planes turn with it: the bump's U
+    /// still runs along the plane's own axis, which is now another world axis, and
+    /// a flat texture still gives back the surface normal in world space.
+    #[test]
+    fn a_turned_terrain_turns_the_side_planes_normals_with_it() {
+        let turn = Mat3::from_rotation_y(40.0_f32.to_radians());
+        for (plane, local_surface, local_u) in [
+            (Plane::X, Vec3::new(0.8, 0.6, 0.0), Vec3::Z),
+            (Plane::X, Vec3::NEG_X, Vec3::Z),
+            (Plane::Z, Vec3::new(0.0, 0.6, 0.8), Vec3::X),
+            (Plane::Z, Vec3::NEG_Z, Vec3::X),
         ] {
-            assert!(plane_world_normal(plane, flat, surface).abs_diff_eq(surface, 1e-6));
+            let world_surface = turn * local_surface;
+
+            // A flat texture is the surface normal, in the world.
+            let flat = side_plane_world(plane, Vec3::Z, local_surface, turn);
+            assert!(
+                flat.abs_diff_eq(world_surface, 1e-5),
+                "{plane:?} over {local_surface}: {flat} against {world_surface}"
+            );
+
+            // U runs along the plane's own axis, which has turned with the
+            // terrain: what a bump leaning toward +U adds to the surface normal
+            // is along that axis in the world, and not along where the world's
+            // axis still is.
+            let bump = side_plane_world(plane, leaning_toward_u(0.3), local_surface, turn);
+            let lean = (bump - flat).normalize();
+            let turned_u = turn * local_u;
+            assert!(
+                lean.dot(turned_u) > 0.95,
+                "{plane:?} over {local_surface}: the lean {lean} should be along {turned_u}"
+            );
+            assert!(
+                lean.dot(local_u) < 0.9,
+                "{plane:?} over {local_surface}: it leans with the world's axis, not the terrain's"
+            );
         }
     }
 

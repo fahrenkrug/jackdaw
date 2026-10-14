@@ -693,6 +693,10 @@ pub struct SurfaceSettings {
     pub relief_depth: f32,
     /// How much of the textures' own grain the near band lays back over a
     /// colour map, `0..1`. 0 is off.
+    ///
+    /// Only a slot that has given up its colour to the colour map is grained, in
+    /// the measure it has ([`TerrainMaterialSlot::texture_colour`] below 1): a
+    /// texture that keeps its own colour already carries its grain.
     pub grain: f32,
 }
 

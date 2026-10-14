@@ -3395,6 +3395,112 @@ mod tests {
         );
     }
 
+    /// The march is up to 38 height fetches a fragment, so it reads at one
+    /// explicit level worked out once. An explicit level turns the sampler's
+    /// anisotropy off, where a gradient read would pay sixteen taps at a
+    /// grazing angle for each.
+    #[test]
+    fn the_relief_march_reads_one_explicit_level_worked_out_once() {
+        let gap = shader_function("relief_gap");
+        assert!(gap.contains("textureSampleLevel("), "{gap}");
+        assert!(!gap.contains("textureSampleGrad("), "{gap}");
+        let travel = shader_function("relief_travel");
+        let mip = travel
+            .find("relief_mip(")
+            .expect("the march works its level out");
+        let first_loop = travel.find("for (").expect("the march loops");
+        assert!(
+            mip < first_loop,
+            "the level is worked out ahead of the loops"
+        );
+        assert_eq!(travel.matches("relief_mip(").count(), 1);
+    }
+
+    /// With one tile there is one march, as before. With several, each tile the
+    /// texture is blended from is marched in its own frame and the distances are
+    /// blended by the tiles' shares: the tile with the most of the fragment
+    /// changes across a contour, and a shift taken from it alone would jump.
+    #[test]
+    fn the_relief_shift_blends_the_tiles_it_marches_rather_than_picking_one() {
+        let body = shader_function("fragment");
+        assert!(body.contains("travel += tap.weight * relief_travel("));
+        assert!(body.contains("travel / max(shares, 1e-8)"));
+        assert!(
+            !body.contains("tiled.taps[i].weight > tap.weight"),
+            "no hard choice of a tile"
+        );
+        assert!(SHADER_SOURCE.contains("const RELIEF_TILED_BUDGET: f32 = 0.5;"));
+    }
+
+    /// The height of the only id a fragment reads cancels in the normalisation,
+    /// so it is neither read nor weighed. The weight is the same 1, exactly, and
+    /// a partial layer weight raised to a high power cannot drive the total under
+    /// the floor and darken the ground.
+    #[test]
+    fn a_lone_id_neither_reads_nor_weighs_its_height() {
+        let body = shader_function("accumulate");
+        let skip = body
+            .find("if !single {")
+            .expect("the height is behind `single`");
+        let read = body
+            .find("height_array, layer_sampler")
+            .expect("the height is read");
+        let weight = body
+            .find("pow(corner_weights")
+            .expect("the weight is taken");
+        assert!(skip < read, "the height read is behind the skip");
+        assert!(
+            body[..weight]
+                .rfind("if !single {")
+                .is_some_and(|at| at > read),
+            "so is the weight"
+        );
+        assert!(shader_function("fragment").contains("let single = live == 1u;"));
+
+        // The floor sits far under what the smallest base a layer can raise
+        // leaves behind at the sharpest blend.
+        assert!(SHADER_SOURCE.contains("const MIN_TOTAL_WEIGHT: f32 = 1e-30;"));
+        let smallest_weight = 0.5f32.powf(SHARPNESS_CEILING) * 0.01;
+        assert!(smallest_weight > 1e-30, "{smallest_weight}");
+    }
+
+    /// The sharpest exponent the blend dial maps to.
+    const SHARPNESS_CEILING: f32 = 64.0;
+
+    /// A colour map is coarse, and the grain is what brings the textures' detail
+    /// back over it, so it is for ground a colour map colours, in the measure the
+    /// slot has given its colour up, and its ratio is bounded: a texture that
+    /// keeps its colour is not grained twice, and a speck is not a highlight.
+    #[test]
+    fn grain_is_for_colour_mapped_ground_scaled_by_what_the_slot_gave_up_and_bounded() {
+        let body = shader_function("fragment");
+        assert!(body.contains("(1.0 - dominant_stats.x)"));
+        assert!(body.contains("splat.colour_map_scale > 0u && grain > 0.0"));
+        assert!(body.contains("max(dominant_stats.y, GRAIN_MIN_LUMINANCE)"));
+        assert!(body.contains("0.0, GRAIN_RATIO_MAX"));
+        assert!(SHADER_SOURCE.contains("const GRAIN_RATIO_MAX: f32 = 4.0;"));
+        assert!(SHADER_SOURCE.contains("const GRAIN_MIN_LUMINANCE: f32 = 0.01;"));
+    }
+
+    /// The side planes are the terrain's own axes, so a terrain turned about Y
+    /// needs their whiteout blend in its space and not in the world's. The sum is
+    /// turned into world axes once, with the inverse transpose of the transform
+    /// that moves positions.
+    #[test]
+    fn the_cliff_whiteout_is_done_in_terrain_space_and_turned_to_world_once() {
+        let accumulate = shader_function("accumulate");
+        assert!(accumulate.contains("frame.local_normal"));
+        assert!(
+            !accumulate.contains("frame.normal"),
+            "the world-space normal is not what the planes blend against"
+        );
+        let fragment = shader_function("fragment");
+        assert!(fragment.contains("normal_to_world * accum.normal_side"));
+        assert!(fragment.contains("local_from_world[0].xyz"));
+        // The relief's sideways shift is in the terrain's axes too.
+        assert!(fragment.contains("* (ray.x * t + ray.y * b)"));
+    }
+
     /// What of Bevy the splat shader leans on, as stubs: the vertex output, the
     /// mesh and view data, and the lighting entry points. Everything else the
     /// test composes is the production source.

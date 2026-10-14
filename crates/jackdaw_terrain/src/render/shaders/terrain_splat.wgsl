@@ -76,6 +76,11 @@ const LUMA: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 // How steep the ground has to be, as `1 - normal.y`, for the side planes to
 // start and to finish taking over from the top one. 0.30 is about 46 degrees
 // of slope and 0.45 about 57.
+//
+// A deliberate change of look, not a fix: every terrain used to be projected
+// from above all the way up a cliff, stretching its texture down the face, and
+// ground steeper than STEEP_START now takes the side projection instead. Gentler
+// ground, flat ground above all, is the top plane alone and draws as it did.
 const STEEP_START: f32 = 0.30;
 const STEEP_END: f32 = 0.45;
 // How sharply the two side planes split, as the exponent on the normal's X and
@@ -88,6 +93,16 @@ const PLANE_CUTOFF: f32 = 0.02;
 
 // The grain read is this many times finer than the texture's own tiling.
 const GRAIN_TILING: f32 = 4.0;
+// The most the grain may scale the albedo by. A texel many times brighter than
+// its texture's average is a speck, not detail.
+const GRAIN_RATIO_MAX: f32 = 4.0;
+// The least mean luminance the grain divides by.
+const GRAIN_MIN_LUMINANCE: f32 = 0.01;
+
+// The smallest sum of height-blend weights worth dividing by. A power of 64 on
+// a base under one is small, not zero, and the albedo is the weighted sum over
+// it, so the floor has to sit below any weight the powers can leave.
+const MIN_TOTAL_WEIGHT: f32 = 1e-30;
 
 // The relief march, after `parallax_field_trace` in crates/parallax of the
 // Hayjump monorepo: a step budget from the grazing angle, then a binary search
@@ -100,6 +115,9 @@ const RELIEF_REFINE_STEPS: u32 = 5u;
 // at this steepness (its vertical share), which bounds the shift to four shell
 // depths.
 const RELIEF_MIN_STEEPNESS: f32 = 0.25;
+// A detiled texture is marched once per tile it is blended from, so each march
+// gets this share of the step budget the near band would give a lone one.
+const RELIEF_TILED_BUDGET: f32 = 0.5;
 
 struct SplatUniform {
     // 16 per-id UV scales, packed four to a vec4 for uniform alignment.
@@ -202,8 +220,10 @@ struct Frame {
     // orthographic view.
     near: f32,
     far: f32,
-    // The surface's normal in world space, before any texture has bent it.
-    normal: vec3<f32>,
+    // The surface's normal in terrain space, before any texture has bent it. The
+    // side planes are the terrain's own axes, so their whiteout blend is done in
+    // its space, and turned into world axes once at the end.
+    local_normal: vec3<f32>,
     // The colour map under the fragment, linear. White where the terrain has
     // none.
     colour: vec3<f32>,
@@ -408,12 +428,18 @@ struct Accum {
 // roughness are one value per id like they always were. The normals are the
 // exception: the top plane keeps its tangent-space normal, which `fragment`
 // turns by the one frame it has, and each side plane's normal is brought into
-// world axes by a whiteout blend here, because a side plane has no frame.
+// the terrain's axes by a whiteout blend here, because a side plane has no
+// frame.
+//
+// `single` is set when this is the only id the fragment reads. Its weight then
+// cancels in the normalisation whatever its height is, so the height is not read
+// and the weight is 1: exact, and one array a tap cheaper.
 fn accumulate(
     accum: Accum,
     id: u32,
     corner_weights: vec4<f32>,
     layer_weights: vec4<f32>,
+    single: bool,
 ) -> Accum {
     let layer_id = min(id, last_layer());
     let layer = i32(layer_id);
@@ -481,8 +507,10 @@ fn accumulate(
             }
             albedo_sum += tap.weight
                 * textureSampleGrad(albedo_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).rgb;
-            height_sum += tap.weight
-                * textureSampleGrad(height_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;
+            if !single {
+                height_sum += tap.weight
+                    * textureSampleGrad(height_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;
+            }
             taken += tap.weight;
             if !detailed {
                 continue;
@@ -524,24 +552,27 @@ fn accumulate(
                 // Whiteout blend (Ben Golus, "Normal Mapping for a Triplanar
                 // Shader"): the plane's tangent-space normal, added to the
                 // surface normal swizzled into the plane's own axes, then
-                // swizzled back to world axes. This shader's tangent Y follows
-                // +V, which on a side plane is down the image, so it is
-                // world -Y; flipping it first leaves everything below in
-                // world orientation, and the same bump reads the same on every
-                // plane. `abs` keeps the plane's back side from inverting.
+                // swizzled back out. The planes are the terrain's own axes, so
+                // all of this is in the terrain's space and a terrain turned
+                // about Y keeps its cliffs right; `fragment` turns the sum into
+                // world axes once. This shader's tangent Y follows +V, which on
+                // a side plane is down the image, so it is terrain -Y; flipping
+                // it first leaves everything below in terrain orientation, and
+                // the same bump reads the same on every plane. `abs` keeps the
+                // plane's back side from inverting.
                 let flipped = vec3<f32>(tangent.x, -tangent.y, tangent.z);
                 if plane == 1u {
                     // U runs along +Z; the surface's X is the plane's normal.
                     let blended = vec3<f32>(
-                        flipped.xy + frame.normal.zy,
-                        abs(flipped.z) * frame.normal.x,
+                        flipped.xy + frame.local_normal.zy,
+                        abs(flipped.z) * frame.local_normal.x,
                     );
                     normal_side += plane_weight * blended.zyx;
                 } else {
                     // U runs along +X; the surface's Z is the plane's normal.
                     let blended = vec3<f32>(
-                        flipped.xy + frame.normal.xy,
-                        abs(flipped.z) * frame.normal.z,
+                        flipped.xy + frame.local_normal.xy,
+                        abs(flipped.z) * frame.local_normal.z,
                     );
                     normal_side += plane_weight * blended;
                 }
@@ -575,9 +606,12 @@ fn accumulate(
     let reflectance = select(DEFAULT_REFLECTANCE, own_reflectance, own_reflectance >= 0.0);
     let roughness = min(roughness_sample * roughness_scale, 1.0);
 
-    let sharpness = SHARPNESS_MIN + SHARPNESS_RANGE * splat.blend_sharpness;
-    let contested = layer_weights + vec4<f32>(height);
-    let weight = dot(pow(corner_weights + contested, vec4<f32>(sharpness)), corner_weights);
+    var weight = 1.0;
+    if !single {
+        let sharpness = SHARPNESS_MIN + SHARPNESS_RANGE * splat.blend_sharpness;
+        let contested = layer_weights + vec4<f32>(height);
+        weight = dot(pow(corner_weights + contested, vec4<f32>(sharpness)), corner_weights);
+    }
 
     var out = accum;
     out.albedo += albedo * weight;
@@ -620,6 +654,20 @@ fn autoterrain_control(slope: f32) -> u32 {
         | ((blend & BLEND_MASK) << BLEND_SHIFT);
 }
 
+// The mip level an isotropic filter would read a height map at, from the
+// derivatives of the coordinates it is read with: the longer of the two screen
+// axes, in texels.
+//
+// The relief march reads the height map at this one level instead of through the
+// anisotropic sampler. An explicit level turns anisotropy off, and the march is
+// up to 38 fetches a fragment, each of which would otherwise cost the sixteen
+// taps a grazing view asks of it.
+fn relief_mip(ddx: vec2<f32>, ddy: vec2<f32>) -> f32 {
+    let size = vec2<f32>(textureDimensions(height_array));
+    let footprint = max(length(ddx * size), length(ddy * size));
+    return max(log2(max(footprint, 1.0)), 0.0);
+}
+
 // How a ray going into the ground stands against the heightfield `travel`
 // metres along it: how far below the surface the ray is, less how far below the
 // top of the shell the heightfield is there. At or under the surface is >= 0.
@@ -627,21 +675,20 @@ fn autoterrain_control(slope: f32) -> u32 {
 // `uv` is where the ray enters, in the dominant tile's own frame, and
 // `uv_per_metre` is how far the sample moves per metre of travel, in the same
 // frame. `steepness` is the ray's share along the surface normal, so the depth
-// it has reached is `travel * steepness`.
+// it has reached is `travel * steepness`. `mip` is from `relief_mip` of the
+// unshifted derivatives, as in any parallax lookup: the shift is small against
+// the texture's own scale and does not change its filtering.
 fn relief_gap(
     layer: i32,
     uv: vec2<f32>,
-    ddx: vec2<f32>,
-    ddy: vec2<f32>,
+    mip: f32,
     uv_per_metre: vec2<f32>,
     steepness: f32,
     depth: f32,
     travel: f32,
 ) -> f32 {
-    // The unshifted derivatives, as in any parallax lookup: the shift is small
-    // against the texture's own scale and does not change its filtering.
-    let height = textureSampleGrad(
-        height_array, layer_sampler, uv + uv_per_metre * travel, layer, ddx, ddy).r;
+    let height = textureSampleLevel(
+        height_array, layer_sampler, uv + uv_per_metre * travel, layer, mip).r;
     return travel * steepness - (1.0 - height) * depth;
 }
 
@@ -662,6 +709,7 @@ fn relief_travel(
     depth: f32,
     lod: f32,
 ) -> f32 {
+    let mip = relief_mip(ddx, ddy);
     // Grazing rays cross many texels per unit of depth, so they get the larger
     // budget.
     let full = RELIEF_MAX_STEPS + (RELIEF_MIN_STEPS - RELIEF_MAX_STEPS) * steepness;
@@ -672,20 +720,20 @@ fn relief_travel(
     let steps = u32(ceil(count));
 
     // A ray that enters at or under the surface has nothing to march through.
-    if relief_gap(layer, uv, ddx, ddy, uv_per_metre, steepness, depth, 0.0) >= 0.0 {
+    if relief_gap(layer, uv, mip, uv_per_metre, steepness, depth, 0.0) >= 0.0 {
         return 0.0;
     }
     var previous = 0.0;
     var travel = 0.0;
     for (var i = 0u; i < steps; i++) {
         travel += dt;
-        if relief_gap(layer, uv, ddx, ddy, uv_per_metre, steepness, depth, travel) >= 0.0 {
+        if relief_gap(layer, uv, mip, uv_per_metre, steepness, depth, travel) >= 0.0 {
             // Binary search between the last sample above and this one below.
             var above = previous;
             var below = travel;
             for (var j = 0u; j < RELIEF_REFINE_STEPS; j++) {
                 let middle = (above + below) * 0.5;
-                if relief_gap(layer, uv, ddx, ddy, uv_per_metre, steepness, depth, middle) >= 0.0 {
+                if relief_gap(layer, uv, mip, uv_per_metre, steepness, depth, middle) >= 0.0 {
                     below = middle;
                 } else {
                     above = middle;
@@ -769,7 +817,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // degrees wherever |n.x| and |n.z| cross, seaming flat ground.
     let world_normal = pbr_functions::prepare_world_normal(in.world_normal, false, is_front);
     let n = normalize(world_normal);
-    frame.normal = n;
     var reference = vec3<f32>(1.0, 0.0, 0.0);
     if abs(n.x) > 0.999 {
         reference = vec3<f32>(0.0, 0.0, 1.0);
@@ -779,11 +826,16 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let tbn = mat3x3<f32>(t, b, n);
 
     // How the three projections share this fragment. The ground's own up is the
-    // terrain's Y, so the normal is taken into terrain space first.
+    // terrain's Y, so the normal is taken into terrain space first. A normal
+    // goes with the inverse transpose of the transform that moves positions:
+    // `world_from_local` transposed one way, `local_from_world` the other.
     let world_from_local = get_world_from_local(in.instance_index);
     let to_local = transpose(mat3x3<f32>(
         world_from_local[0].xyz, world_from_local[1].xyz, world_from_local[2].xyz));
     let local_normal = normalize(to_local * n);
+    frame.local_normal = local_normal;
+    let normal_to_world = transpose(mat3x3<f32>(
+        local_from_world[0].xyz, local_from_world[1].xyz, local_from_world[2].xyz));
     let steep = smoothstep(STEEP_START, STEEP_END, 1.0 - local_normal.y);
     frame.planes = vec3<f32>(1.0, 0.0, 0.0);
     if steep > 0.0 {
@@ -920,6 +972,19 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let dominant_layer = i32(dominant_id);
     let dominant_scale = uv_scale_for(dominant_id);
 
+    // How many of those ids take any of the fragment at all. A corner share of
+    // nothing on every corner, as on a grid line, is a set of reads that change
+    // no pixel, so such an id is skipped below; and when one id is all that is
+    // left, its height cannot change the result and is not read.
+    var live = 0u;
+    for (var e = 0u; e < entries; e++) {
+        let corners = entry_corners[e];
+        if corners.x + corners.y + corners.z + corners.w > 0.0 {
+            live += 1u;
+        }
+    }
+    let single = live == 1u;
+
     // Parallax relief: march a ray from the eye into a shell of `relief_depth`
     // under the top plane, against the dominant texture's height map, and shift
     // the top plane's position, for every id, to where it met it. Colour and
@@ -940,30 +1005,44 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             // The shell fades out with the band, so relief does not pop away at
             // its far edge.
             let depth = splat.relief_depth * frame.near;
-            // Metres of sideways travel in the top plane's X and Z, per metre of
-            // travel along the ray. The plane is planar in X and Z, so what
-            // moves the sample is the ray's X and Z, not its length along the
-            // slope.
-            let xz_per_metre = ray.x * vec2<f32>(t.x, t.z) + ray.y * vec2<f32>(b.x, b.z);
-            // The dominant texture's own tile frame at this fragment. With
-            // detiling off there is one tap and this is the plain tiling; with
-            // it on, the tile that has most of the fragment.
+            // Metres of sideways travel in the terrain's X and Z, per metre of
+            // travel along the ray. The plane is planar in the terrain's X and
+            // Z, so what moves the sample is the ray's X and Z in the terrain's
+            // space, not its length along the slope, and not the world's axes
+            // where the terrain is turned.
+            let along_ray = mat3x3<f32>(
+                local_from_world[0].xyz, local_from_world[1].xyz, local_from_world[2].xyz)
+                * (ray.x * t + ray.y * b);
+            let xz_per_metre = along_ray.xz;
+            // The dominant texture's own tile frames at this fragment. With
+            // detiling off there is one tap and this is the plain tiling. With it
+            // on, each tile the texture is blended from is marched in its own
+            // frame and the distances blended by the same shares, so the shift is
+            // as continuous as the blend is; the shares are what a hard choice of
+            // one tile would jump across.
             let tiled = detile(
                 frame.top * dominant_scale,
                 frame.top_ddx * dominant_scale,
                 frame.top_ddy * dominant_scale,
                 detile_for(dominant_id),
             );
-            var tap = tiled.taps[0];
-            for (var i = 1u; i < tiled.count; i++) {
-                if tiled.taps[i].weight > tap.weight {
-                    tap = tiled.taps[i];
-                }
+            var lod = frame.near;
+            if tiled.count > 1u {
+                lod *= RELIEF_TILED_BUDGET;
             }
-            let uv_per_metre = turned_by(xz_per_metre * dominant_scale, tap.turn);
-            let travel = relief_travel(
-                dominant_layer, tap.uv, tap.ddx, tap.ddy, uv_per_metre, steepness, depth, frame.near);
-            frame.top += xz_per_metre * travel;
+            var travel = 0.0;
+            var shares = 0.0;
+            for (var i = 0u; i < tiled.count; i++) {
+                let tap = tiled.taps[i];
+                if tap.weight <= 1e-4 {
+                    continue;
+                }
+                let uv_per_metre = turned_by(xz_per_metre * dominant_scale, tap.turn);
+                travel += tap.weight * relief_travel(
+                    dominant_layer, tap.uv, tap.ddx, tap.ddy, uv_per_metre, steepness, depth, lod);
+                shares += tap.weight;
+            }
+            frame.top += xz_per_metre * (travel / max(shares, 1e-8));
         }
     }
 
@@ -977,22 +1056,26 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     accum.total = 0.0;
     for (var e = 0u; e < entries; e++) {
         let corners = entry_corners[e];
-        // A corner share of nothing on every corner, as on a grid line, is a
-        // set of reads that change no pixel.
         if corners.x + corners.y + corners.z + corners.w <= 0.0 {
             continue;
         }
-        accum = accumulate(accum, entry_ids[e], corners, entry_layers[e]);
+        accum = accumulate(accum, entry_ids[e], corners, entry_layers[e], single);
     }
 
-    let inv_total = 1.0 / max(accum.total, 1e-8);
+    let inv_total = 1.0 / max(accum.total, MIN_TOTAL_WEIGHT);
     var albedo = accum.albedo * inv_total;
 
     // Grain: one more read of the dominant texture, at four times its tiling on
     // the plane that has most of the fragment, laid over the albedo as the
     // ratio of its light to the texture's average. It brings back the fine
-    // detail a colour map is too coarse to carry.
-    if frame.near > 0.0 && splat.grain > 0.0 {
+    // detail a colour map is too coarse to carry, so it is only for ground a
+    // colour map colours, and only as far as the texture has given its colour
+    // up to the map: a texture that keeps all of its colour already carries its
+    // own grain, and a second copy at four times the tiling would square the
+    // contrast.
+    let dominant_stats = splat.slot_stats[dominant_id];
+    let grain = splat.grain * frame.near * (1.0 - dominant_stats.x);
+    if splat.colour_map_scale > 0u && grain > 0.0 {
         var uv = frame.top * dominant_scale;
         var ddx = frame.top_ddx * dominant_scale;
         var ddy = frame.top_ddy * dominant_scale;
@@ -1013,8 +1096,9 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             ddx * GRAIN_TILING,
             ddy * GRAIN_TILING,
         ).rgb;
-        let dominant_luminance = splat.slot_stats[dominant_id].y;
-        albedo *= mix(1.0, luminance(fine) / dominant_luminance, splat.grain * frame.near);
+        let ratio = clamp(
+            luminance(fine) / max(dominant_stats.y, GRAIN_MIN_LUMINANCE), 0.0, GRAIN_RATIO_MAX);
+        albedo *= mix(1.0, ratio, grain);
     }
 
     albedo *= mix(vec3<f32>(1.0), tint, splat.tint_strength);
@@ -1022,10 +1106,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let roughness = accum.roughness * inv_total;
     let reflectance = accum.reflectance * inv_total;
 
-    // The top plane's tangent-space normals take the frame above, the side
-    // planes' are in world axes already. Out in the far band no normal map was
-    // read and the surface's own normal stands; in the fade ring the two are
-    // mixed.
+    // The top plane's tangent-space normals take the frame above; the side
+    // planes' are in the terrain's axes, and turn into world axes here, once,
+    // with the length they had. Out in the far band no normal map was read and
+    // the surface's own normal stands; in the fade ring the two are mixed.
     var mapped_normal = n;
     if frame.far < 1.0 {
         if frame.planes.x >= 1.0 {
@@ -1034,7 +1118,14 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             // taken, so flat ground comes out bit for bit as it did.
             mapped_normal = normalize(tbn * normalize(accum.normal_top * inv_total));
         } else {
-            mapped_normal = normalize((tbn * accum.normal_top + accum.normal_side) * inv_total);
+            let side = normal_to_world * accum.normal_side;
+            let side_length = length(accum.normal_side);
+            let side_world = select(
+                vec3<f32>(0.0),
+                normalize(side) * side_length,
+                dot(side, side) > 0.0,
+            );
+            mapped_normal = normalize((tbn * accum.normal_top + side_world) * inv_total);
         }
         if frame.far > 0.0 {
             mapped_normal = normalize(mix(mapped_normal, n, frame.far));
