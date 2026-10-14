@@ -15,9 +15,9 @@ use bevy::asset::{AssetEvent, LoadState};
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use jackdaw_terrain::render::{
-    SplatArrayHandles, SplatBuildError, TerrainRenderPlugin, TerrainSplatMaterial,
-    TextureSetImages, control_image_from_bytes, resolve_with, slope_image, splat_images,
-    tint_image_from_bytes,
+    ColourMapBinding, SplatArrayHandles, SplatBuildError, TerrainRenderPlugin,
+    TerrainSplatMaterial, TextureSetImages, control_image_from_bytes, resolve_with, slope_image,
+    splat_images, tint_image_from_bytes,
 };
 use jackdaw_terrain::sidecar::{AutoTerrainSettings, SurfaceSettings, TerrainMaterialSlot};
 use jackdaw_terrain::splat::ControlTexels;
@@ -41,6 +41,7 @@ pub(super) fn plugin(app: &mut App) {
                 build_ready_materials,
                 refresh_autoterrain,
                 refresh_surface,
+                refresh_colour_maps,
                 refresh_control_maps,
                 refresh_tint_maps,
                 refresh_slope_maps,
@@ -102,6 +103,10 @@ struct SplatEntry {
     /// [`Self::built_autoterrain`]: `refresh_surface` writes the new
     /// numbers into the bound material rather than rebuilding.
     built_surface: SurfaceSettings,
+    /// Each slot's texture colour as the uniform carries it, on the same terms
+    /// as [`Self::built_surface`]: it is a uniform and nothing else, so a change
+    /// to it is written into the bound material and rebuilds no array.
+    built_texture_colours: Vec<f32>,
     /// Whether the chunks are carrying a material this entry has dropped.
     /// Chunks pick their material up at mesh-build time, so dropping the
     /// handle here is not enough.
@@ -234,7 +239,13 @@ fn resolve_terrain_materials(
             &assets,
         );
         let entry = materials.entries.entry(data_path).or_default();
-        if entry.slots == slots && entry.set == resolved.set && entry.missing == resolved.missing {
+        // A texture colour is a uniform and nothing else, so a list that
+        // differs in nothing but those keeps its arrays; `refresh_surface`
+        // writes them.
+        if same_but_texture_colours(&entry.slots, &slots)
+            && entry.set == resolved.set
+            && entry.missing == resolved.missing
+        {
             continue;
         }
         // The id space moved under the brush, so a pick past the end of the
@@ -251,6 +262,12 @@ fn resolve_terrain_materials(
         entry.error = None;
         entry.needs_chunk_rebuild = true;
     }
+}
+
+/// Whether two material lists are the same but for their slots' texture
+/// colours.
+fn same_but_texture_colours(a: &[TerrainMaterialSlot], b: &[TerrainMaterialSlot]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.same_but_texture_colour(b))
 }
 
 /// Record a problem for the Textures tab and log it once, then stay quiet
@@ -349,20 +366,30 @@ fn build_ready_materials(
             height: images.add(built.height),
             occlusion: images.add(built.occlusion),
             roughness: images.add(built.roughness),
+            stats: built.stats,
         };
         let autoterrain = store.autoterrain(&terrain.data_path);
         let surface = store.surface(&terrain.data_path);
+        let texture_colours = slot_colours(store.materials(&terrain.data_path));
+        // Built from the document as it stands, which is also what clears the
+        // mark `refresh_colour_maps` would upload the same map for.
+        store.take_colour_map_dirty(&terrain.data_path);
+        let colour_map =
+            ColourMapBinding::upload(store.colour_map(&terrain.data_path), &mut images);
         let material = splat_materials.add(TerrainSplatMaterial::new(
             &entry.set,
+            &texture_colours,
             arrays,
             control.clone(),
             slope.clone(),
             tint.clone(),
+            colour_map,
             shape.size,
             shape.resolution,
             autoterrain,
             surface,
         ));
+        entry.built_texture_colours = texture_colours;
         entry.slope = Some(slope);
         entry.slope_heights = Some(heights);
         entry.control = Some(control);
@@ -429,11 +456,18 @@ fn refresh_autoterrain(
     }
 }
 
-/// Follow a terrain's surface settings into the material it draws with.
+/// Each slot's texture colour, one per texture id.
+fn slot_colours(slots: &[TerrainMaterialSlot]) -> Vec<f32> {
+    slots.iter().map(|slot| slot.texture_colour).collect()
+}
+
+/// Follow a terrain's surface settings and its slots' texture colours into the
+/// material it draws with.
 ///
-/// A uniform write only, on `refresh_autoterrain`'s terms: the blend
-/// sharpness and the tint strength are two numbers the fragment reads, so
-/// moving either re-uploads one buffer and rebuilds nothing.
+/// A uniform write only, on `refresh_autoterrain`'s terms: the blend sharpness,
+/// the tint strength, the near and far bands, the relief and the grain are
+/// numbers the fragment reads, as is each slot's texture colour, so moving any
+/// of them re-uploads one buffer and rebuilds nothing.
 fn refresh_surface(
     mut materials: ResMut<TerrainSplatMaterials>,
     mut splat_materials: ResMut<Assets<TerrainSplatMaterial>>,
@@ -445,7 +479,8 @@ fn refresh_surface(
             continue;
         };
         let wanted = store.surface(&terrain.data_path);
-        if entry.built_surface == wanted {
+        let colours = slot_colours(store.materials(&terrain.data_path));
+        if entry.built_surface == wanted && entry.built_texture_colours == colours {
             continue;
         }
         let Some(handle) = entry.material.clone() else {
@@ -455,7 +490,42 @@ fn refresh_surface(
             continue;
         };
         material.set_surface(wanted);
+        material.set_texture_colours(&colours);
         entry.built_surface = wanted;
+        entry.built_texture_colours = colours;
+    }
+}
+
+/// Follow a terrain's colour map into the material it draws with.
+///
+/// A map arrives with its document and is never edited in place, so the store
+/// only says that one was replaced. The image is rebuilt whole and the material
+/// pointed at it, which is also what makes the bind group pick it up. An entry
+/// with no material yet is left alone, and keeps the mark, so the map reaches it
+/// through `build_ready_materials`.
+fn refresh_colour_maps(
+    materials: Res<TerrainSplatMaterials>,
+    mut splat_materials: ResMut<Assets<TerrainSplatMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    store: Res<TerrainDataStore>,
+    terrains: Query<&jackdaw_scene_types::Terrain>,
+) {
+    for terrain in &terrains {
+        let Some(handle) = materials
+            .entries
+            .get(&terrain.data_path)
+            .and_then(|entry| entry.material.clone())
+        else {
+            continue;
+        };
+        let Some(mut material) = splat_materials.get_mut(&handle) else {
+            continue;
+        };
+        if !store.take_colour_map_dirty(&terrain.data_path) {
+            continue;
+        }
+        let binding = ColourMapBinding::upload(store.colour_map(&terrain.data_path), &mut images);
+        material.set_colour_map(binding);
     }
 }
 

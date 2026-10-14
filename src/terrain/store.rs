@@ -12,14 +12,14 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use bevy::platform::collections::HashMap;
+use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 use jackdaw_terrain::region::RegionCoord;
 #[cfg(test)]
 use jackdaw_terrain::region::RegionSize;
 use jackdaw_terrain::render::ScatterDirty;
 use jackdaw_terrain::sidecar::{
-    self, AutoTerrainSettings, RegionTerrainData, SurfaceSettings, TerrainMaterialSlot,
+    self, AutoTerrainSettings, ColourMap, RegionTerrainData, SurfaceSettings, TerrainMaterialSlot,
 };
 use jackdaw_terrain::texture_set::MAX_TEXTURES;
 use jackdaw_terrain::{Control, GridRect, GridShape};
@@ -119,6 +119,11 @@ pub struct TerrainDataStore {
     /// renderer last uploaded it. Kept beside [`Self::control_dirty`], and
     /// behind a lock for the same reason.
     tint_dirty: Mutex<HashMap<String, GridRect>>,
+    /// Which terrains' colour maps have been replaced since the renderer last
+    /// uploaded them. A map is never edited in place, so a mark is all there is
+    /// to say about it. Beside the other dirty marks, and behind a lock for the
+    /// same reason.
+    colour_map_dirty: Mutex<HashSet<String>>,
     /// Which of each terrain's regions have had their stored scatter written
     /// since the renderer last drew them. Beside the other dirty marks, and
     /// behind a lock for the same reason.
@@ -535,6 +540,7 @@ impl TerrainDataStore {
         self.load_failed.remove(&data_path);
         self.mark_control_dirty(&data_path, GridRect::whole(data.grid_resolution()));
         self.mark_tint_dirty(&data_path, GridRect::whole(data.grid_resolution()));
+        self.mark_colour_map_dirty(&data_path);
         self.mark_scatter_dirty(&data_path, None);
         self.entries.insert(data_path, data);
     }
@@ -1037,6 +1043,32 @@ impl TerrainDataStore {
     /// was last called, clearing the mark.
     pub fn take_tint_dirty(&self, data_path: &str) -> Option<GridRect> {
         self.tint_dirty
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(data_path)
+    }
+
+    /// A terrain's colour map, baked outside the editor and carried with its
+    /// document. `None` for a terrain with no document or no map.
+    pub fn colour_map(&self, data_path: &str) -> Option<&ColourMap> {
+        self.entries.get(data_path)?.colour_map.as_ref()
+    }
+
+    /// Records that a terrain's colour map needs uploading.
+    fn mark_colour_map_dirty(&self, data_path: &str) {
+        self.colour_map_dirty
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(data_path.to_string());
+    }
+
+    /// Whether a terrain's colour map has been replaced since this was last
+    /// called, clearing the mark.
+    ///
+    /// The renderer calls this only once it has somewhere to upload to, so a map
+    /// that arrives before the material exists keeps its mark until then.
+    pub fn take_colour_map_dirty(&self, data_path: &str) -> bool {
+        self.colour_map_dirty
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(data_path)

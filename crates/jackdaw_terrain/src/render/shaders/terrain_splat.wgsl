@@ -84,6 +84,27 @@ struct SplatUniform {
     // Bit i is set where texture id i has a roughness map. An id without
     // one takes `perceptual_roughness`.
     roughness_slots: u32,
+    // Per id: x = how much of the slot's own texture colour it keeps against
+    // the colour map (1 keeps all of it), y = the mean luminance of its albedo
+    // (linear, never under 0.01), z = the mean of its roughness map's green
+    // (1 without a map), w = the mean of its occlusion map's red (1 without).
+    slot_stats: array<vec4<f32>, 16>,
+    // Metres from the camera within which the near band applies, and past which
+    // the far band does. 0 turns the band off.
+    near_distance: f32,
+    far_distance: f32,
+    // Depth of the parallax relief below the surface, in metres. 0 is off.
+    relief_depth: f32,
+    // How much of the textures' finer grain the near band lays over the colour
+    // map, 0..1.
+    grain: f32,
+    // Bit i is set where texture id i has a height map of its own, not the
+    // filled 0.5 layer a slot without one gets. Relief needs a real one.
+    height_slots: u32,
+    // Texels per grid cell of the colour map, 0 where the terrain has none.
+    colour_map_scale: u32,
+    // Texels along one edge of the colour map.
+    colour_map_side: u32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> splat: SplatUniform;
@@ -97,6 +118,8 @@ struct SplatUniform {
 @group(#{MATERIAL_BIND_GROUP}) @binding(8) var tint_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(9) var occlusion_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(10) var roughness_array: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(11) var colour_map: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(12) var colour_map_sampler: sampler;
 
 // The last id this material can address: one short of the bound set's
 // layer count, and never past the UV-scale array. Every id is clamped

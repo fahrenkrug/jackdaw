@@ -556,6 +556,32 @@ impl TerrainMaterialSlot {
         self.material.is_empty()
     }
 
+    /// Whether two slots are the same in everything but their texture colour.
+    ///
+    /// The texture colour reaches the shader as a uniform and nothing else, so
+    /// a host that watches its slot list for changes that need the texture
+    /// arrays rebuilt can let that one through. Every other field is compared,
+    /// and a field added to the slot has to be placed here before this builds.
+    pub fn same_but_texture_colour(&self, other: &Self) -> bool {
+        let Self {
+            material,
+            uv_scale,
+            detile,
+            occlusion,
+            roughness,
+            perceptual_roughness,
+            reflectance,
+            texture_colour: _,
+        } = self;
+        *material == other.material
+            && *uv_scale == other.uv_scale
+            && *detile == other.detile
+            && *occlusion == other.occlusion
+            && *roughness == other.roughness
+            && *perceptual_roughness == other.perceptual_roughness
+            && *reflectance == other.reflectance
+    }
+
     /// Clamp the floats into the bounds downstream code assumes: non-finite
     /// becomes the field's default, out of range clamps.
     ///
@@ -737,7 +763,7 @@ pub const MAX_RELIEF_DEPTH: f32 = 0.5;
 pub const DEFAULT_GRAIN: f32 = 0.0;
 
 /// A `0..1` dial, with non-finite falling back to `default`.
-fn sane_unit(value: f32, default: f32) -> f32 {
+pub(crate) fn sane_unit(value: f32, default: f32) -> f32 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
     } else {
@@ -3915,6 +3941,50 @@ mod tests {
 
         let back = decode_regions(&encode_regions(&data).expect("encodes")).expect("decodes");
         assert_eq!(back.materials, data.materials);
+    }
+
+    /// A host watching its slot list for a change that needs the arrays rebuilt
+    /// lets the texture colour through and nothing else.
+    #[test]
+    fn two_slots_that_differ_in_nothing_but_texture_colour_are_the_same_but_for_it() {
+        let slot = TerrainMaterialSlot::new("materials/grass.material.bsn");
+        let dimmer = TerrainMaterialSlot {
+            texture_colour: 0.25,
+            ..slot.clone()
+        };
+        assert!(slot.same_but_texture_colour(&dimmer));
+        assert!(dimmer.same_but_texture_colour(&slot));
+        assert_ne!(slot, dimmer);
+
+        for other in [
+            TerrainMaterialSlot::new("materials/rock.material.bsn"),
+            TerrainMaterialSlot {
+                uv_scale: 0.5,
+                ..slot.clone()
+            },
+            TerrainMaterialSlot {
+                detile: 0.5,
+                ..slot.clone()
+            },
+            TerrainMaterialSlot {
+                occlusion: "ao.png".to_string(),
+                ..slot.clone()
+            },
+            TerrainMaterialSlot {
+                roughness: "rough.png".to_string(),
+                ..slot.clone()
+            },
+            TerrainMaterialSlot {
+                perceptual_roughness: Some(0.5),
+                ..slot.clone()
+            },
+            TerrainMaterialSlot {
+                reflectance: Some(0.5),
+                ..slot.clone()
+            },
+        ] {
+            assert!(!slot.same_but_texture_colour(&other), "{other:?}");
+        }
     }
 
     /// A file written before the near and far bands, the colour map and the

@@ -21,10 +21,11 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use jackdaw_scene_types::Terrain;
 use jackdaw_terrain::render::{
-    DetailDirty, DetailRenderPlugin, DetailSystems, ScatterDirty, ScatterPrefab, ScatterPrefabs,
-    ScatterRenderPlugin, ScatterSystems, SplatArrayHandles, SplatBuildError, TerrainDetailSource,
-    TerrainRenderPlugin, TerrainScatter, TerrainSplatMaterial, TextureSetImages,
-    control_image_from_bytes, resolve_with, slope_image, splat_images, tint_image,
+    ColourMapBinding, DetailDirty, DetailRenderPlugin, DetailSystems, ScatterDirty, ScatterPrefab,
+    ScatterPrefabs, ScatterRenderPlugin, ScatterSystems, SplatArrayHandles, SplatBuildError,
+    TerrainDetailSource, TerrainRenderPlugin, TerrainScatter, TerrainSplatMaterial,
+    TextureSetImages, control_image_from_bytes, resolve_with, slope_image, splat_images,
+    tint_image,
 };
 use jackdaw_terrain::sidecar::{self, TerrainMaterialSlot};
 use jackdaw_terrain::splat::ControlTexels;
@@ -402,13 +403,21 @@ fn build_ready_materials(
             height: images.add(built.height),
             occlusion: images.add(built.occlusion),
             roughness: images.add(built.roughness),
+            stats: built.stats,
         };
+        // The colour map is one white texel where the terrain has none, which
+        // the shader never reads.
+        let colour_map = ColourMapBinding::upload(document.data.colour_map.as_ref(), &mut images);
+        let texture_colours: Vec<f32> =
+            splat.slots.iter().map(|slot| slot.texture_colour).collect();
         splat.material = Some(splat_materials.add(TerrainSplatMaterial::new(
             &splat.set,
+            &texture_colours,
             arrays,
             control,
             slope,
             tint,
+            colour_map,
             shape.size,
             shape.resolution,
             document.data.autoterrain,
@@ -965,16 +974,12 @@ mod tests {
 
         let material = TerrainSplatMaterial::new(
             &TextureSet::default(),
-            SplatArrayHandles {
-                albedo: Handle::default(),
-                normal: Handle::default(),
-                height: Handle::default(),
-                occlusion: Handle::default(),
-                roughness: Handle::default(),
-            },
+            &[],
+            SplatArrayHandles::default(),
             Handle::default(),
             Handle::default(),
             Handle::default(),
+            ColourMapBinding::default(),
             Vec2::splat(100.0),
             4,
             document.data.autoterrain,
@@ -993,16 +998,12 @@ mod tests {
     fn a_terrain_that_never_asked_for_autoterrain_draws_from_its_control_map_alone() {
         let material = TerrainSplatMaterial::new(
             &TextureSet::default(),
-            SplatArrayHandles {
-                albedo: Handle::default(),
-                normal: Handle::default(),
-                height: Handle::default(),
-                occlusion: Handle::default(),
-                roughness: Handle::default(),
-            },
+            &[],
+            SplatArrayHandles::default(),
             Handle::default(),
             Handle::default(),
             Handle::default(),
+            ColourMapBinding::default(),
             Vec2::splat(100.0),
             4,
             RegionTerrainData::default().autoterrain,

@@ -40,11 +40,11 @@ pub use scatter::{
 };
 
 use crate::heightmap::Heightmap;
-use crate::sidecar::{AutoTerrainSettings, SurfaceSettings, TerrainMaterialSlot};
+use crate::sidecar::{AutoTerrainSettings, ColourMap, SurfaceSettings, TerrainMaterialSlot};
 use crate::splat::ControlTexels;
 use crate::texture_set::{
-    DEFAULT_PERCEPTUAL_ROUGHNESS, MAX_TEXTURES, TextureSet, TextureSetEntry, TextureSetError,
-    check_layer_sizes,
+    DEFAULT_PERCEPTUAL_ROUGHNESS, DEFAULT_TEXTURE_COLOUR, MAX_TEXTURES, TextureSet,
+    TextureSetEntry, TextureSetError, check_layer_sizes,
 };
 
 const SHADER_PATH: &str = "embedded://jackdaw_terrain/render/shaders/terrain_splat.wgsl";
@@ -72,6 +72,14 @@ const UNMAPPED_LAYER_TEXEL: [u8; 4] = [255, 255, 255, 255];
 /// the slot keeps its texture id and the ids painted after it do not
 /// shift.
 const FALLBACK_ALBEDO_TEXEL: [u8; 4] = [128, 128, 128, 255];
+/// Anisotropic filtering the layer arrays and the colour map are sampled with:
+/// the most wgpu allows. Ground is mostly seen at a grazing angle, where
+/// trilinear filtering smears a texture into mush.
+const ANISOTROPY: u16 = 16;
+/// The least a slot's mean albedo luminance is taken to be. The shader divides
+/// a texel's luminance by it, and a near-black texture would otherwise divide
+/// by next to nothing.
+const MIN_MEAN_LUMINANCE: f32 = 0.01;
 
 /// The loaded image handles for a [`TextureSet`], parallel to its entries.
 ///
@@ -240,6 +248,37 @@ pub struct SplatImages {
     pub height: Image,
     pub occlusion: Image,
     pub roughness: Image,
+    /// What was measured of each layer on the way in, one per texture id.
+    pub stats: Vec<SlotStats>,
+}
+
+/// What the shader knows of a slot's textures without reading them: the
+/// averages of its layers, taken from the smallest mip of each as the arrays
+/// are stacked.
+///
+/// The far band draws from these in place of the maps they average, and the
+/// colour map takes the albedo's light and dark relative to the first.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SlotStats {
+    /// Mean luminance of the albedo, Rec. 709 weights on linear values and never
+    /// under 0.01.
+    pub mean_luminance: f32,
+    /// Mean of the roughness map's green channel. 1 for a slot with no
+    /// roughness map, which is the sample the shader takes of such a slot: its
+    /// own roughness, or the terrain's, scales it.
+    pub mean_roughness: f32,
+    /// Mean of the occlusion map's red channel. 1 without one.
+    pub mean_occlusion: f32,
+}
+
+impl SlotStats {
+    /// What an id past the end of the set carries. The shader clamps every id
+    /// into the set, so nothing reads it; it only has to be finite.
+    pub const NEUTRAL: Self = Self {
+        mean_luminance: 1.0,
+        mean_roughness: 1.0,
+        mean_occlusion: 1.0,
+    };
 }
 
 /// Why a texture set could not be stacked into arrays yet, or at all.
@@ -287,6 +326,9 @@ impl core::error::Error for SplatBuildError {}
 ///
 /// A normal map flagged [`TextureSetEntry::flip_normal_y`] has its green channel
 /// inverted here, once, on the way into the array.
+///
+/// The albedo, occlusion and roughness layers are averaged on the way, from the
+/// last mip of each chain, into [`SplatImages::stats`].
 pub fn splat_images(
     set: &TextureSet,
     handles: &TextureSetImages,
@@ -313,7 +355,7 @@ pub fn splat_images(
         None => (1, 1),
     };
 
-    let albedo = stack(
+    let (albedo, albedo_means) = stack(
         &albedo_layers,
         handles.albedo.len(),
         (width, height),
@@ -324,7 +366,7 @@ pub fn splat_images(
     )?;
 
     let normal_flips: Vec<bool> = set.entries.iter().map(|e| e.flip_normal_y).collect();
-    let normal = stack_optional(
+    let (normal, _) = stack_optional(
         &handles.normal,
         set,
         images,
@@ -334,7 +376,7 @@ pub fn splat_images(
         MipFilter::Normal,
         |entry| entry.normal.as_deref().unwrap_or_default(),
     )?;
-    let height_array = stack_optional(
+    let (height_array, _) = stack_optional(
         &handles.height,
         set,
         images,
@@ -344,7 +386,7 @@ pub fn splat_images(
         MipFilter::Linear,
         |entry| entry.height.as_deref().unwrap_or_default(),
     )?;
-    let occlusion = stack_optional(
+    let (occlusion, occlusion_means) = stack_optional(
         &handles.occlusion,
         set,
         images,
@@ -354,7 +396,7 @@ pub fn splat_images(
         MipFilter::Linear,
         |entry| entry.occlusion.as_deref().unwrap_or_default(),
     )?;
-    let roughness = stack_optional(
+    let (roughness, roughness_means) = stack_optional(
         &handles.roughness,
         set,
         images,
@@ -365,12 +407,27 @@ pub fn splat_images(
         |entry| entry.roughness.as_deref().unwrap_or_default(),
     )?;
 
+    // A layer with no map is the fill, whose mean is the fill: white, so 1 for
+    // the occlusion and for the roughness sample the shader takes of such a
+    // slot.
+    let stats = albedo_means
+        .iter()
+        .zip(&roughness_means)
+        .zip(&occlusion_means)
+        .map(|((albedo, roughness), occlusion)| SlotStats {
+            mean_luminance: linear_luminance(*albedo).max(MIN_MEAN_LUMINANCE),
+            mean_roughness: f32::from(roughness[1]) / 255.0,
+            mean_occlusion: f32::from(occlusion[0]) / 255.0,
+        })
+        .collect();
+
     Ok(SplatImages {
         albedo,
         normal,
         height: height_array,
         occlusion,
         roughness,
+        stats,
     })
 }
 
@@ -412,6 +469,8 @@ fn decode_layers<'a>(
 /// Build one array from a per-entry list of optional handles. A layer with no
 /// handle is filled with `fill`; if no entry has one at all, the whole array
 /// collapses to 1x1.
+///
+/// Returns each layer's smallest mip beside the array.
 fn stack_optional(
     handles: &[Option<Handle<Image>>],
     set: &TextureSet,
@@ -421,9 +480,10 @@ fn stack_optional(
     flip_green: &[bool],
     filter: MipFilter,
     path_of: impl Fn(&TextureSetEntry) -> &str,
-) -> Result<Image, SplatBuildError> {
+) -> Result<(Image, Vec<[u8; 4]>), SplatBuildError> {
     if handles.iter().all(Option::is_none) {
-        return Ok(fill_array(1, 1, handles.len().max(1) as u32, fill));
+        let layers = handles.len().max(1);
+        return Ok((fill_array(1, 1, layers as u32, fill), vec![fill; layers]));
     }
     let layers = decode_layers(handles, set, images, path_of)?;
     stack(
@@ -439,6 +499,9 @@ fn stack_optional(
 
 /// Lay decoded layers out as one array image, filling the entries that
 /// resolved to nothing and refusing any that disagrees on size.
+///
+/// Returns each layer's smallest mip beside the array: one texel, which is the
+/// layer's average as far as the mip filter can tell.
 fn stack(
     layers: &DecodedLayers<'_>,
     entry_count: usize,
@@ -447,7 +510,7 @@ fn stack(
     fill: [u8; 4],
     flip_green: &[bool],
     filter: MipFilter,
-) -> Result<Image, SplatBuildError> {
+) -> Result<(Image, Vec<[u8; 4]>), SplatBuildError> {
     // Measured against the albedo size, not against each other: every
     // array in a set shares one layer size.
     for (entry, material, path, size) in layers.sizes.iter().copied() {
@@ -464,6 +527,7 @@ fn stack(
 
     let texel_count = (width as usize) * (height as usize);
     let mut data = Vec::with_capacity(chain_texels(width, height) * 4 * entry_count.max(1));
+    let mut smallest = Vec::with_capacity(entry_count.max(1));
     for (index, image) in layers.decoded.iter().enumerate() {
         let base = match image {
             Some(image) => {
@@ -477,15 +541,10 @@ fn stack(
             }
             None => fill.iter().copied().cycle().take(texel_count * 4).collect(),
         };
-        push_mip_chain(&mut data, base, width, height, filter);
+        smallest.push(push_mip_chain(&mut data, base, width, height, filter));
     }
-    Ok(array_image(
-        width,
-        height,
-        entry_count.max(1) as u32,
-        format,
-        data,
-    ))
+    let array = array_image(width, height, entry_count.max(1) as u32, format, data);
+    Ok((array, smallest))
 }
 
 /// An image's texels in `format`, converting if it decoded as something
@@ -688,7 +747,15 @@ fn downsample(src: &[u8], width: u32, height: u32, filter: MipFilter) -> Vec<u8>
 /// The arrays upload as [`TextureDataOrder::LayerMajor`], which reads a
 /// layer's whole chain before the next layer's base, so a caller stacking
 /// layers appends each chain whole.
-fn push_mip_chain(data: &mut Vec<u8>, base: Vec<u8>, width: u32, height: u32, filter: MipFilter) {
+///
+/// Returns the chain's last texel: the one-texel mip, the layer's average.
+fn push_mip_chain(
+    data: &mut Vec<u8>,
+    base: Vec<u8>,
+    width: u32,
+    height: u32,
+    filter: MipFilter,
+) -> [u8; 4] {
     let levels = mip_level_count(width, height);
     data.extend_from_slice(&base);
     let mut level = base;
@@ -699,6 +766,14 @@ fn push_mip_chain(data: &mut Vec<u8>, base: Vec<u8>, width: u32, height: u32, fi
         h = (h / 2).max(1);
         data.extend_from_slice(&level);
     }
+    [level[0], level[1], level[2], level[3]]
+}
+
+/// Rec. 709 luminance of an sRGB-encoded texel, taken in linear light.
+fn linear_luminance(texel: [u8; 4]) -> f32 {
+    0.2126 * srgb_to_linear(texel[0])
+        + 0.7152 * srgb_to_linear(texel[1])
+        + 0.0722 * srgb_to_linear(texel[2])
 }
 
 fn fill_array(width: u32, height: u32, layers: u32, fill: [u8; 4]) -> Image {
@@ -714,8 +789,51 @@ fn array_image(
     format: TextureFormat,
     data: Vec<u8>,
 ) -> Image {
+    let mut image = mip_chained_image(
+        width,
+        height,
+        layers,
+        format,
+        data,
+        ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::Repeat,
+            address_mode_v: ImageAddressMode::Repeat,
+            ..linear_anisotropic()
+        },
+    );
+    // A one-layer array still has to present as an array to the shader,
+    // which wgpu will not infer from `depth_or_array_layers == 1`.
+    image.texture_view_descriptor = Some(TextureViewDescriptor {
+        dimension: Some(TextureViewDimension::D2Array),
+        ..default()
+    });
+    image
+}
+
+/// A sampler that filters linearly within and between mip levels, at
+/// [`ANISOTROPY`]. wgpu refuses anisotropy on a sampler with any other filter.
+fn linear_anisotropic() -> ImageSamplerDescriptor {
+    ImageSamplerDescriptor {
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        anisotropy_clamp: ANISOTROPY,
+        ..default()
+    }
+}
+
+/// An image whose data already holds a whole mip chain per layer, sampled by
+/// `sampler`.
+fn mip_chained_image(
+    width: u32,
+    height: u32,
+    layers: u32,
+    format: TextureFormat,
+    data: Vec<u8>,
+    sampler: ImageSamplerDescriptor,
+) -> Image {
     // Built uninitialized because `Image::new` checks the buffer against
-    // one mip level, and these arrays carry a whole chain per layer.
+    // one mip level, and these images carry a whole chain per layer.
     let mut image = Image::new_uninit(
         Extent3d {
             width,
@@ -726,27 +844,14 @@ fn array_image(
         format,
         RenderAssetUsages::RENDER_WORLD,
     );
-    // The sampler below filters between mip levels, so the levels have to
-    // exist: without them every fragment reads the sharpest texels, and
-    // detiled UVs that decorrelate neighbouring fragments turn mid-range
-    // ground into noise. `push_mip_chain` laid the data out to match.
+    // The sampler filters between mip levels, so the levels have to exist:
+    // without them every fragment reads the sharpest texels, and detiled UVs
+    // that decorrelate neighbouring fragments turn mid-range ground into
+    // noise. `push_mip_chain` laid the data out to match.
     image.texture_descriptor.mip_level_count = mip_level_count(width, height);
     image.data_order = TextureDataOrder::LayerMajor;
     image.data = Some(data);
-    // A one-layer array still has to present as an array to the shader,
-    // which wgpu will not infer from `depth_or_array_layers == 1`.
-    image.texture_view_descriptor = Some(TextureViewDescriptor {
-        dimension: Some(TextureViewDimension::D2Array),
-        ..default()
-    });
-    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-        address_mode_u: ImageAddressMode::Repeat,
-        address_mode_v: ImageAddressMode::Repeat,
-        mag_filter: ImageFilterMode::Linear,
-        min_filter: ImageFilterMode::Linear,
-        mipmap_filter: ImageFilterMode::Linear,
-        ..default()
-    });
+    image.sampler = ImageSampler::Descriptor(sampler);
     image
 }
 
@@ -833,6 +938,87 @@ pub fn tint_image_from_bytes(bytes: &[u8], resolution: u32) -> Image {
 pub fn tint_uv(uv: f32, resolution: u32) -> f32 {
     let res = resolution.max(2) as f32;
     (uv * (res - 1.0) + 0.5) / res
+}
+
+/// The terrain's colour map as an uploadable image: `Rgba8UnormSrgb` with a
+/// full mip chain, or one white texel for a terrain with none.
+///
+/// Filtered, clamped to the edge and anisotropic. The map is coarse against the
+/// ground it colours, so it is magnified close up and wants its mips from far
+/// off. The chain is averaged in linear light, as the albedo arrays' are.
+///
+/// A map that fails [`ColourMap::validate`] builds the white texel rather than
+/// reading past the texels it has.
+pub fn colour_map_image(map: Option<&ColourMap>) -> Image {
+    let (side, base) = match map.filter(|map| map.validate().is_ok()) {
+        Some(map) => (map.side, map.texels.iter().flatten().copied().collect()),
+        None => (1, vec![u8::MAX; 4]),
+    };
+    let mut data = Vec::with_capacity(chain_texels(side, side) * 4);
+    push_mip_chain(&mut data, base, side, side, MipFilter::Srgb);
+    mip_chained_image(
+        side,
+        side,
+        1,
+        TextureFormat::Rgba8UnormSrgb,
+        data,
+        ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::ClampToEdge,
+            address_mode_v: ImageAddressMode::ClampToEdge,
+            ..linear_anisotropic()
+        },
+    )
+}
+
+/// UV0 remapped onto the colour map's texel centres.
+///
+/// The splat shader computes this inline, as it does [`tint_uv`], and for the
+/// same reason: UV0 places grid point `i` at `i/(res-1)`, and the map's texel
+/// `scale * i` lies on that point and is centred at `(scale*i + 0.5)/side`. For
+/// a scale of 1 the side is the control resolution and this is [`tint_uv`] on
+/// each axis.
+#[must_use]
+pub fn colour_map_uv(uv: Vec2, side: u32) -> Vec2 {
+    let side = side.max(2) as f32;
+    (uv * (side - 1.0) + Vec2::splat(0.5)) / side
+}
+
+/// A terrain's colour map as the material binds it: the uploaded image, and
+/// what the shader needs to sample it.
+#[derive(Clone, Debug)]
+pub struct ColourMapBinding {
+    /// [`colour_map_image`] of the map, once it is in `Assets<Image>`.
+    pub image: Handle<Image>,
+    /// Texels per grid cell, or 0 where the terrain has no colour map and the
+    /// image is a single white texel.
+    pub scale: u32,
+    /// Texels along one edge of the image.
+    pub side: u32,
+}
+
+impl ColourMapBinding {
+    /// Add the image for `map`, or the white one for none, to `images`, and
+    /// describe it. A map that fails [`ColourMap::validate`] is bound as none.
+    pub fn upload(map: Option<&ColourMap>, images: &mut Assets<Image>) -> Self {
+        let map = map.filter(|map| map.validate().is_ok());
+        Self {
+            image: images.add(colour_map_image(map)),
+            scale: map.map_or(0, |map| u32::from(map.scale)),
+            side: map.map_or(1, |map| map.side),
+        }
+    }
+}
+
+impl Default for ColourMapBinding {
+    /// No colour map, and no image yet: what a material starts with before it
+    /// is pointed at one.
+    fn default() -> Self {
+        Self {
+            image: Handle::default(),
+            scale: 0,
+            side: 1,
+        }
+    }
 }
 
 /// [`tint_image_from_bytes`] from a dense colour layer.
@@ -955,6 +1141,41 @@ pub struct TerrainSplatMaterial {
     /// without one takes [`Self::perceptual_roughness`].
     #[uniform(0)]
     pub roughness_slots: u32,
+    /// Per id: x is how much of the slot's own texture colour it keeps against
+    /// the colour map, y the mean luminance of its albedo, z the mean of its
+    /// roughness map (1 without one) and w the mean of its occlusion map (1
+    /// without one). See [`SlotStats`]. The far band reads the means in place
+    /// of the maps, and the colour map takes the albedo's light and dark
+    /// relative to the first.
+    #[uniform(0)]
+    pub slot_stats: [Vec4; MAX_TEXTURES],
+    /// Metres from the camera within which the near band applies. 0 turns it
+    /// off. See [`SurfaceSettings::near_distance`].
+    #[uniform(0)]
+    pub near_distance: f32,
+    /// Metres from the camera past which the far band applies. 0 turns it off.
+    /// See [`SurfaceSettings::far_distance`].
+    #[uniform(0)]
+    pub far_distance: f32,
+    /// Depth of the near band's parallax relief, in metres. 0 is off. See
+    /// [`SurfaceSettings::relief_depth`].
+    #[uniform(0)]
+    pub relief_depth: f32,
+    /// How much of the textures' grain the near band lays over the colour map,
+    /// `0..1`. See [`SurfaceSettings::grain`].
+    #[uniform(0)]
+    pub grain: f32,
+    /// Bit `i` is set where texture id `i` has a height map of its own, not
+    /// the filled middle-grey layer a slot without one gets. The relief marches
+    /// only through a real one.
+    #[uniform(0)]
+    pub height_slots: u32,
+    /// Texels per grid cell of the colour map, or 0 where the terrain has none.
+    #[uniform(0)]
+    pub colour_map_scale: u32,
+    /// Texels along one edge of the colour map.
+    #[uniform(0)]
+    pub colour_map_side: u32,
     #[texture(1, dimension = "2d_array")]
     #[sampler(2)]
     pub albedo: Handle<Image>,
@@ -980,6 +1201,11 @@ pub struct TerrainSplatMaterial {
     /// metallic-roughness texture stores it.
     #[texture(10, dimension = "2d_array")]
     pub roughness: Handle<Image>,
+    /// The terrain's colour map, or one white texel without one. Filtered and
+    /// clamped, so it has a sampler of its own.
+    #[texture(11)]
+    #[sampler(12)]
+    pub colour_map: Handle<Image>,
 }
 
 impl Material for TerrainSplatMaterial {
@@ -991,12 +1217,18 @@ impl Material for TerrainSplatMaterial {
 impl TerrainSplatMaterial {
     /// Build a material for a terrain from its set, its arrays, its
     /// control map and how it textures the cells no hand has claimed.
+    ///
+    /// `texture_colours` is each slot's [`TerrainMaterialSlot::texture_colour`],
+    /// one per texture id; an id past its end keeps its own colour.
+    /// `colour_map` is the terrain's, from [`ColourMapBinding::upload`].
     pub fn new(
         set: &TextureSet,
+        texture_colours: &[f32],
         arrays: SplatArrayHandles,
         control: Handle<Image>,
         slope: Handle<Image>,
         tint: Handle<Image>,
+        colour_map: ColourMapBinding,
         terrain_size: Vec2,
         control_resolution: u32,
         autoterrain: AutoTerrainSettings,
@@ -1038,6 +1270,14 @@ impl TerrainSplatMaterial {
             tint_strength: crate::sidecar::DEFAULT_TINT_STRENGTH,
             occlusion_slots: slot_mask(set, |entry| entry.occlusion.is_some()),
             roughness_slots: slot_mask(set, |entry| entry.roughness.is_some()),
+            slot_stats: [Vec4::ZERO; MAX_TEXTURES],
+            near_distance: crate::sidecar::DEFAULT_NEAR_DISTANCE,
+            far_distance: crate::sidecar::DEFAULT_FAR_DISTANCE,
+            relief_depth: crate::sidecar::DEFAULT_RELIEF_DEPTH,
+            grain: crate::sidecar::DEFAULT_GRAIN,
+            height_slots: slot_mask(set, |entry| entry.height.is_some()),
+            colour_map_scale: colour_map.scale,
+            colour_map_side: colour_map.side,
             albedo: arrays.albedo,
             normal: arrays.normal,
             height: arrays.height,
@@ -1046,10 +1286,41 @@ impl TerrainSplatMaterial {
             tint,
             occlusion: arrays.occlusion,
             roughness: arrays.roughness,
+            colour_map: colour_map.image,
         };
+        for (id, stats) in material.slot_stats.iter_mut().enumerate() {
+            let measured = arrays.stats.get(id).copied().unwrap_or(SlotStats::NEUTRAL);
+            *stats = Vec4::new(
+                DEFAULT_TEXTURE_COLOUR,
+                measured.mean_luminance,
+                measured.mean_roughness,
+                measured.mean_occlusion,
+            );
+        }
+        material.set_texture_colours(texture_colours);
         material.set_autoterrain(autoterrain);
         material.set_surface(surface);
         material
+    }
+
+    /// Point each slot's texture colour at `colours`, one per texture id; an id
+    /// past the end keeps its own colour. A uniform write, like
+    /// [`Self::set_surface`], and sanitized on the way in for the same reason.
+    pub fn set_texture_colours(&mut self, colours: &[f32]) {
+        for (id, stats) in self.slot_stats.iter_mut().enumerate() {
+            let wanted = colours.get(id).copied().unwrap_or(DEFAULT_TEXTURE_COLOUR);
+            stats.x = crate::sidecar::sane_unit(wanted, DEFAULT_TEXTURE_COLOUR);
+        }
+    }
+
+    /// Point the colour map half of the uniform and the binding at `colour_map`,
+    /// from [`ColourMapBinding::upload`]. The old image is dropped with the
+    /// handle, and the material is written, which is what makes the bind group
+    /// pick the new one up.
+    pub fn set_colour_map(&mut self, colour_map: ColourMapBinding) {
+        self.colour_map_scale = colour_map.scale;
+        self.colour_map_side = colour_map.side;
+        self.colour_map = colour_map.image;
     }
 
     /// Point the autoterrain half of the uniform at `settings`.
@@ -1077,6 +1348,10 @@ impl TerrainSplatMaterial {
         let settings = settings.sanitized();
         self.blend_sharpness = settings.blend_sharpness;
         self.tint_strength = settings.tint_strength;
+        self.near_distance = settings.near_distance;
+        self.far_distance = settings.far_distance;
+        self.relief_depth = settings.relief_depth;
+        self.grain = settings.grain;
     }
 }
 
@@ -1094,14 +1369,18 @@ fn slot_mask(set: &TextureSet, has_map: impl Fn(&TextureSetEntry) -> bool) -> u3
     mask
 }
 
-/// The array images once they are in `Assets<Image>`.
-#[derive(Clone, Debug)]
+/// The array images once they are in `Assets<Image>`, with what
+/// [`splat_images`] measured of their layers on the way.
+#[derive(Clone, Debug, Default)]
 pub struct SplatArrayHandles {
     pub albedo: Handle<Image>,
     pub normal: Handle<Image>,
     pub height: Handle<Image>,
     pub occlusion: Handle<Image>,
     pub roughness: Handle<Image>,
+    /// [`SplatImages::stats`]: one entry per texture id. Ids it does not reach
+    /// carry [`SlotStats::NEUTRAL`].
+    pub stats: Vec<SlotStats>,
 }
 
 /// Registers the texture-set asset, its loader, the splat material and its
@@ -2184,26 +2463,33 @@ mod tests {
         pinned(format!("const MANUAL_BIT: u32 = 0x{MANUAL_BIT:X}u;"));
     }
 
-    fn test_material(autoterrain: AutoTerrainSettings) -> TerrainSplatMaterial {
+    /// A material over `set` with nothing behind its handles, for the tests that
+    /// read the uniform.
+    fn material_over(set: &TextureSet, texture_colours: &[f32]) -> TerrainSplatMaterial {
         TerrainSplatMaterial::new(
+            set,
+            texture_colours,
+            SplatArrayHandles::default(),
+            Handle::default(),
+            Handle::default(),
+            Handle::default(),
+            ColourMapBinding::default(),
+            Vec2::splat(100.0),
+            256,
+            AutoTerrainSettings::default(),
+            SurfaceSettings::default(),
+        )
+    }
+
+    fn test_material(autoterrain: AutoTerrainSettings) -> TerrainSplatMaterial {
+        let mut material = material_over(
             &TextureSet {
                 entries: vec![TextureSetEntry::new("grass", "a.png")],
             },
-            SplatArrayHandles {
-                albedo: Handle::default(),
-                normal: Handle::default(),
-                height: Handle::default(),
-                occlusion: Handle::default(),
-                roughness: Handle::default(),
-            },
-            Handle::default(),
-            Handle::default(),
-            Handle::default(),
-            Vec2::splat(100.0),
-            256,
-            autoterrain,
-            SurfaceSettings::default(),
-        )
+            &[],
+        );
+        material.set_autoterrain(autoterrain);
+        material
     }
 
     /// Off is the default, and off means the uniform says nothing the
@@ -2292,24 +2578,7 @@ mod tests {
                 },
             ],
         };
-        let arrays = SplatArrayHandles {
-            albedo: Handle::default(),
-            normal: Handle::default(),
-            height: Handle::default(),
-            occlusion: Handle::default(),
-            roughness: Handle::default(),
-        };
-        let material = TerrainSplatMaterial::new(
-            &set,
-            arrays,
-            Handle::default(),
-            Handle::default(),
-            Handle::default(),
-            Vec2::splat(100.0),
-            256,
-            AutoTerrainSettings::default(),
-            SurfaceSettings::default(),
-        );
+        let material = material_over(&set, &[]);
         assert_eq!(material.uv_scales[0].x, 0.25);
         assert_eq!(material.uv_scales[0].y, 4.0);
         assert_eq!(material.layer_count, 2);
@@ -2332,23 +2601,7 @@ mod tests {
                 },
             ],
         };
-        let material = TerrainSplatMaterial::new(
-            &set,
-            SplatArrayHandles {
-                albedo: Handle::default(),
-                normal: Handle::default(),
-                height: Handle::default(),
-                occlusion: Handle::default(),
-                roughness: Handle::default(),
-            },
-            Handle::default(),
-            Handle::default(),
-            Handle::default(),
-            Vec2::splat(100.0),
-            256,
-            AutoTerrainSettings::default(),
-            SurfaceSettings::default(),
-        );
+        let material = material_over(&set, &[]);
         assert_eq!(material.slot_roughness[0].y, 0.4);
         assert_eq!(material.slot_reflectance[0].y, 0.2);
         assert!(material.slot_roughness[0].x < 0.0);
@@ -2375,23 +2628,7 @@ mod tests {
                 },
             ],
         };
-        let material = TerrainSplatMaterial::new(
-            &set,
-            SplatArrayHandles {
-                albedo: Handle::default(),
-                normal: Handle::default(),
-                height: Handle::default(),
-                occlusion: Handle::default(),
-                roughness: Handle::default(),
-            },
-            Handle::default(),
-            Handle::default(),
-            Handle::default(),
-            Vec2::splat(100.0),
-            256,
-            AutoTerrainSettings::default(),
-            SurfaceSettings::default(),
-        );
+        let material = material_over(&set, &[]);
 
         assert_eq!(material.occlusion_slots, 0b010);
         assert_eq!(material.roughness_slots, 0b100);
@@ -2416,6 +2653,8 @@ mod tests {
             (7, "var tint_map: texture_2d<f32>"),
             (9, "var occlusion_array: texture_2d_array<f32>"),
             (10, "var roughness_array: texture_2d_array<f32>"),
+            (11, "var colour_map: texture_2d<f32>"),
+            (12, "var colour_map_sampler: sampler"),
         ] {
             let expected =
                 format!("@group(#{{MATERIAL_BIND_GROUP}}) @binding({binding}) {declaration};");
@@ -2458,6 +2697,14 @@ mod tests {
             "tint_strength: f32",
             "occlusion_slots: u32",
             "roughness_slots: u32",
+            "slot_stats: array<vec4<f32>, 16>",
+            "near_distance: f32",
+            "far_distance: f32",
+            "relief_depth: f32",
+            "grain: f32",
+            "height_slots: u32",
+            "colour_map_scale: u32",
+            "colour_map_side: u32",
         ] {
             let found = body[at..]
                 .find(field)
@@ -2555,23 +2802,7 @@ mod tests {
     /// identity.
     #[test]
     fn a_tint_strength_of_zero_leaves_the_albedo_alone() {
-        let mut material = TerrainSplatMaterial::new(
-            &TextureSet::default(),
-            SplatArrayHandles {
-                albedo: Handle::default(),
-                normal: Handle::default(),
-                height: Handle::default(),
-                occlusion: Handle::default(),
-                roughness: Handle::default(),
-            },
-            Handle::default(),
-            Handle::default(),
-            Handle::default(),
-            Vec2::splat(100.0),
-            256,
-            AutoTerrainSettings::default(),
-            SurfaceSettings::default(),
-        );
+        let mut material = material_over(&TextureSet::default(), &[]);
         assert_eq!(material.tint_strength, 1.0, "the default is the full layer");
 
         material.set_surface(SurfaceSettings {
@@ -2624,29 +2855,24 @@ mod tests {
     /// uniform write clamps rather than trusting its caller.
     #[test]
     fn the_surface_uniform_is_sanitized_on_the_way_in() {
-        let material = TerrainSplatMaterial::new(
-            &TextureSet::default(),
-            SplatArrayHandles {
-                albedo: Handle::default(),
-                normal: Handle::default(),
-                height: Handle::default(),
-                occlusion: Handle::default(),
-                roughness: Handle::default(),
-            },
-            Handle::default(),
-            Handle::default(),
-            Handle::default(),
-            Vec2::splat(100.0),
-            256,
-            AutoTerrainSettings::default(),
-            SurfaceSettings {
-                blend_sharpness: f32::NAN,
-                tint_strength: 9.0,
-                ..SurfaceSettings::default()
-            },
-        );
+        let mut material = material_over(&TextureSet::default(), &[]);
+        material.set_surface(SurfaceSettings {
+            blend_sharpness: f32::NAN,
+            tint_strength: 9.0,
+            near_distance: f32::NAN,
+            far_distance: 1e9,
+            relief_depth: -1.0,
+            grain: f32::INFINITY,
+        });
         assert_eq!(material.blend_sharpness, DEFAULT_BLEND_SHARPNESS);
         assert_eq!(material.tint_strength, 1.0);
+        assert_eq!(
+            material.near_distance,
+            crate::sidecar::DEFAULT_NEAR_DISTANCE
+        );
+        assert_eq!(material.far_distance, crate::sidecar::MAX_FAR_DISTANCE);
+        assert_eq!(material.relief_depth, 0.0);
+        assert_eq!(material.grain, crate::sidecar::DEFAULT_GRAIN);
     }
 
     /// `MAX_TEXTURES` sizes the UV-scale array on both sides.
@@ -2661,5 +2887,392 @@ mod tests {
             SHADER_SOURCE.contains("uv_scales: array<vec4<f32>, 4>"),
             "the UV-scale array must hold MAX_TEXTURES / 4 vec4s"
         );
+        assert!(
+            SHADER_SOURCE.contains("slot_stats: array<vec4<f32>, 16>"),
+            "the slot statistics must hold one vec4 per texture id"
+        );
+    }
+
+    fn sampler_of(image: &Image) -> &ImageSamplerDescriptor {
+        match &image.sampler {
+            ImageSampler::Descriptor(descriptor) => descriptor,
+            ImageSampler::Default => panic!("the builder always names its sampler"),
+        }
+    }
+
+    /// Ground is mostly seen at a grazing angle. wgpu refuses anisotropy on a
+    /// sampler with any filter that is not linear, so the filters are pinned
+    /// beside it.
+    #[test]
+    fn every_layer_array_is_sampled_anisotropically_with_linear_filters() {
+        let (images, set, handles) = loaded_set(&[(4, 4), (4, 4)]);
+        let built = splat_images(&set, &handles, &images).expect("stacks");
+        for array in [
+            &built.albedo,
+            &built.normal,
+            &built.height,
+            &built.occlusion,
+            &built.roughness,
+        ] {
+            let sampler = sampler_of(array);
+            assert_eq!(sampler.anisotropy_clamp, 16);
+            assert_eq!(sampler.mag_filter, ImageFilterMode::Linear);
+            assert_eq!(sampler.min_filter, ImageFilterMode::Linear);
+            assert_eq!(sampler.mipmap_filter, ImageFilterMode::Linear);
+            assert_eq!(sampler.address_mode_u, ImageAddressMode::Repeat);
+        }
+    }
+
+    /// Rec. 709 luminance of an sRGB texel, spelled out with the transfer
+    /// function and not the builder's table.
+    fn luminance_of(srgb: [u8; 3]) -> f32 {
+        let linear = |byte: u8| ((f32::from(byte) / 255.0 + 0.055) / 1.055).powf(2.4);
+        0.2126 * linear(srgb[0]) + 0.7152 * linear(srgb[1]) + 0.0722 * linear(srgb[2])
+    }
+
+    /// The statistics come from each layer's smallest mip: the albedo's mean
+    /// luminance in linear light, and the roughness and occlusion means as the
+    /// channels the shader reads.
+    #[test]
+    fn slot_statistics_are_the_means_of_the_layers_the_shader_would_read() {
+        let mut images = Assets::<Image>::default();
+        let sunlit = [200u8, 180, 90];
+        let albedo = [
+            images.add(solid(
+                8,
+                8,
+                [sunlit[0], sunlit[1], sunlit[2], 255],
+                TextureFormat::Rgba8UnormSrgb,
+            )),
+            images.add(solid(
+                8,
+                8,
+                [30, 60, 90, 255],
+                TextureFormat::Rgba8UnormSrgb,
+            )),
+        ];
+        let roughness = images.add(solid(8, 8, [0, 51, 0, 255], TextureFormat::Rgba8Unorm));
+        let occlusion = images.add(solid(8, 8, [102, 0, 0, 255], TextureFormat::Rgba8Unorm));
+        let set = TextureSet {
+            entries: vec![
+                TextureSetEntry {
+                    occlusion: Some("o.png".into()),
+                    roughness: Some("r.png".into()),
+                    ..TextureSetEntry::new("sunlit", "a.png")
+                },
+                TextureSetEntry::new("bare", "b.png"),
+            ],
+        };
+        let handles = TextureSetImages {
+            albedo: albedo.iter().cloned().map(Some).collect(),
+            normal: vec![None, None],
+            height: vec![None, None],
+            occlusion: vec![Some(occlusion), None],
+            roughness: vec![Some(roughness), None],
+        };
+
+        let built = splat_images(&set, &handles, &images).expect("stacks");
+
+        assert_eq!(built.stats.len(), 2);
+        let [sunlit_stats, bare] = [built.stats[0], built.stats[1]];
+        assert!((sunlit_stats.mean_luminance - luminance_of(sunlit)).abs() < 2e-3);
+        assert!((sunlit_stats.mean_roughness - 0.2).abs() < 1e-6);
+        assert!((sunlit_stats.mean_occlusion - 0.4).abs() < 1e-6);
+        assert!((bare.mean_luminance - luminance_of([30, 60, 90])).abs() < 2e-3);
+        assert_eq!(
+            bare.mean_roughness, 1.0,
+            "a slot with no roughness map is sampled as 1, and scaled by its own roughness after"
+        );
+        assert_eq!(bare.mean_occlusion, 1.0, "no occlusion map is unoccluded");
+    }
+
+    /// The shader divides by the luminance, so a black texture must not.
+    #[test]
+    fn a_black_albedo_has_a_mean_luminance_floor() {
+        let mut images = Assets::<Image>::default();
+        let albedo = images.add(solid(4, 4, [0, 0, 0, 255], TextureFormat::Rgba8UnormSrgb));
+        let set = TextureSet {
+            entries: vec![TextureSetEntry::new("coal", "a.png")],
+        };
+        let handles = TextureSetImages {
+            albedo: vec![Some(albedo)],
+            normal: vec![None],
+            height: vec![None],
+            occlusion: vec![None],
+            roughness: vec![None],
+        };
+
+        let built = splat_images(&set, &handles, &images).expect("stacks");
+
+        assert_eq!(built.stats[0].mean_luminance, 0.01);
+        assert_eq!(built.stats[0].mean_roughness, 1.0);
+        assert_eq!(built.stats[0].mean_occlusion, 1.0);
+    }
+
+    /// A slot whose material has no albedo draws the grey fallback, and its mean
+    /// is that grey's luminance.
+    #[test]
+    fn a_slot_with_no_albedo_averages_as_the_fallback_grey() {
+        let images = Assets::<Image>::default();
+        let set = TextureSet {
+            entries: vec![TextureSetEntry::unresolved("gone", 0.1)],
+        };
+        let handles = TextureSetImages {
+            albedo: vec![None],
+            normal: vec![None],
+            height: vec![None],
+            occlusion: vec![None],
+            roughness: vec![None],
+        };
+
+        let built = splat_images(&set, &handles, &images).expect("stacks");
+
+        assert!((built.stats[0].mean_luminance - luminance_of([128, 128, 128])).abs() < 2e-3);
+    }
+
+    /// The stats ride to the uniform beside the slot's texture colour, ids past
+    /// the set carry the neutral stats, and the dials and masks land where the
+    /// shader reads them.
+    #[test]
+    fn the_uniform_carries_the_stats_the_dials_and_the_height_mask() {
+        let set = TextureSet {
+            entries: vec![
+                TextureSetEntry::new("grass", "a.png"),
+                TextureSetEntry {
+                    height: Some("b_h.png".to_string()),
+                    ..TextureSetEntry::new("rock", "b.png")
+                },
+            ],
+        };
+        let arrays = SplatArrayHandles {
+            stats: vec![
+                SlotStats {
+                    mean_luminance: 0.25,
+                    mean_roughness: 0.5,
+                    mean_occlusion: 0.75,
+                },
+                SlotStats {
+                    mean_luminance: 0.125,
+                    mean_roughness: 1.0,
+                    mean_occlusion: 1.0,
+                },
+            ],
+            ..SplatArrayHandles::default()
+        };
+        let material = TerrainSplatMaterial::new(
+            &set,
+            &[0.0, 0.5],
+            arrays,
+            Handle::default(),
+            Handle::default(),
+            Handle::default(),
+            ColourMapBinding {
+                image: Handle::default(),
+                scale: 2,
+                side: 129,
+            },
+            Vec2::splat(100.0),
+            65,
+            AutoTerrainSettings::default(),
+            SurfaceSettings {
+                near_distance: 45.0,
+                far_distance: 300.0,
+                relief_depth: 0.125,
+                grain: 0.5,
+                ..SurfaceSettings::default()
+            },
+        );
+
+        assert_eq!(material.slot_stats[0], Vec4::new(0.0, 0.25, 0.5, 0.75));
+        assert_eq!(material.slot_stats[1], Vec4::new(0.5, 0.125, 1.0, 1.0));
+        assert_eq!(
+            material.slot_stats[2],
+            Vec4::new(DEFAULT_TEXTURE_COLOUR, 1.0, 1.0, 1.0),
+            "an id past the set keeps its colour and carries neutral means"
+        );
+        assert_eq!(material.near_distance, 45.0);
+        assert_eq!(material.far_distance, 300.0);
+        assert_eq!(material.relief_depth, 0.125);
+        assert_eq!(material.grain, 0.5);
+        assert_eq!(
+            material.height_slots, 0b10,
+            "only the slot with a height map of its own is marked"
+        );
+        assert_eq!(material.colour_map_scale, 2);
+        assert_eq!(material.colour_map_side, 129);
+    }
+
+    /// With nothing said the dials are what existing terrains render at.
+    #[test]
+    fn a_default_material_has_the_default_bands_and_no_colour_map() {
+        let material = material_over(&TextureSet::default(), &[]);
+        assert_eq!(material.near_distance, 30.0);
+        assert_eq!(material.far_distance, 150.0);
+        assert_eq!(material.relief_depth, 0.0);
+        assert_eq!(material.grain, 0.0);
+        assert_eq!(material.colour_map_scale, 0);
+        assert_eq!(material.height_slots, 0);
+        assert!(material.slot_stats.iter().all(|stats| stats.x == 1.0));
+    }
+
+    /// A texture colour is a uniform write: it clamps, touches only its own
+    /// component, and an id with none to read goes back to keeping its own colour.
+    #[test]
+    fn texture_colours_are_written_alone_and_clamped() {
+        let set = TextureSet {
+            entries: vec![TextureSetEntry::new("grass", "a.png")],
+        };
+        let mut material = material_over(&set, &[]);
+        material.slot_stats[1] = Vec4::new(0.9, 0.2, 0.3, 0.4);
+        let before = material.slot_stats;
+
+        material.set_texture_colours(&[0.25, f32::NAN, 7.0, -1.0]);
+
+        assert_eq!(material.slot_stats[0].x, 0.25);
+        assert_eq!(material.slot_stats[1].x, 1.0, "NaN keeps the slot's colour");
+        assert_eq!(material.slot_stats[2].x, 1.0);
+        assert_eq!(material.slot_stats[3].x, 0.0);
+        assert_eq!(material.slot_stats[4].x, 1.0, "past the list, the default");
+        for id in 0..MAX_TEXTURES {
+            assert_eq!(
+                material.slot_stats[id].to_array()[1..],
+                before[id].to_array()[1..],
+                "id {id}: only the texture colour moved"
+            );
+        }
+    }
+
+    /// The colour map goes up with a whole mip chain, sRGB, clamped at its edge.
+    #[test]
+    fn the_colour_map_image_is_srgb_with_a_full_mip_chain_and_a_clamped_sampler() {
+        let texels: Vec<[u8; 4]> = (0..25u8).map(|i| [i, i * 2, i * 3, 255]).collect();
+        let map = ColourMap::new(3, 2, texels.clone()).expect("5 by 5");
+
+        let image = colour_map_image(Some(&map));
+
+        assert_eq!(
+            image.texture_descriptor.format,
+            TextureFormat::Rgba8UnormSrgb
+        );
+        assert_eq!(image.texture_descriptor.size.width, 5);
+        assert_eq!(image.texture_descriptor.size.depth_or_array_layers, 1);
+        assert_eq!(
+            image.texture_descriptor.mip_level_count, 3,
+            "5, 2 and 1 texels"
+        );
+        let data = image.data.as_ref().expect("built images carry data");
+        assert_eq!(data.len(), (25 + 4 + 1) * 4);
+        assert_eq!(&data[..4], &texels[0]);
+        assert_eq!(&data[24 * 4..25 * 4], &texels[24]);
+        assert!(
+            image.texture_view_descriptor.is_none(),
+            "a plain 2D texture, not an array"
+        );
+        let sampler = sampler_of(&image);
+        assert_eq!(sampler.address_mode_u, ImageAddressMode::ClampToEdge);
+        assert_eq!(sampler.address_mode_v, ImageAddressMode::ClampToEdge);
+        assert_eq!(sampler.mag_filter, ImageFilterMode::Linear);
+        assert_eq!(sampler.min_filter, ImageFilterMode::Linear);
+        assert_eq!(sampler.mipmap_filter, ImageFilterMode::Linear);
+        assert_eq!(sampler.anisotropy_clamp, 16);
+    }
+
+    /// The mips are averaged in linear light like the albedo arrays', so a
+    /// black and white checker reads mid grey in linear light, not 128.
+    #[test]
+    fn the_colour_map_mips_average_in_linear_light() {
+        let mut texels = Vec::new();
+        for y in 0..2u32 {
+            for x in 0..2u32 {
+                texels.push(if (x + y) % 2 == 0 {
+                    [0, 0, 0, 255]
+                } else {
+                    [255, 255, 255, 255]
+                });
+            }
+        }
+        let map = ColourMap::new(2, 1, texels).expect("2 by 2");
+
+        let image = colour_map_image(Some(&map));
+
+        let data = image.data.as_ref().expect("built images carry data");
+        assert_eq!(&data[16..20], &[188, 188, 188, 255]);
+    }
+
+    /// No colour map is one white texel, and so is one the format could not
+    /// have stored.
+    #[test]
+    fn no_colour_map_binds_a_single_white_texel() {
+        let mut images = Assets::<Image>::default();
+        let none = ColourMapBinding::upload(None, &mut images);
+        assert_eq!((none.scale, none.side), (0, 1));
+        let image = images.get(&none.image).expect("uploaded");
+        assert_eq!(image.texture_descriptor.size.width, 1);
+        assert_eq!(image.data.as_deref(), Some(&[255u8; 4][..]));
+
+        let unfit = ColourMap {
+            scale: 9,
+            side: 2,
+            texels: vec![[1; 4]; 4],
+        };
+        let refused = ColourMapBinding::upload(Some(&unfit), &mut images);
+        assert_eq!(
+            (refused.scale, refused.side),
+            (0, 1),
+            "a map the format cannot hold is bound as none"
+        );
+    }
+
+    #[test]
+    fn a_colour_map_binding_describes_the_map_it_uploaded() {
+        let mut images = Assets::<Image>::default();
+        let map = ColourMap::new(3, 4, vec![[9, 8, 7, 255]; 81]).expect("9 by 9");
+
+        let binding = ColourMapBinding::upload(Some(&map), &mut images);
+
+        assert_eq!((binding.scale, binding.side), (4, 9));
+        assert_eq!(
+            images
+                .get(&binding.image)
+                .expect("uploaded")
+                .texture_descriptor
+                .size
+                .width,
+            9
+        );
+        let mut material = material_over(&TextureSet::default(), &[]);
+        material.set_colour_map(binding.clone());
+        assert_eq!(material.colour_map_scale, 4);
+        assert_eq!(material.colour_map_side, 9);
+        assert_eq!(material.colour_map, binding.image);
+    }
+
+    /// At a scale of 1 the colour map is laid out like the tint, texel for grid
+    /// point, so the two mappings must agree exactly. At higher scales texel
+    /// `scale * i` is centred on grid point `i`.
+    #[test]
+    fn the_colour_map_is_sampled_at_texel_centres_as_the_tint_is() {
+        for resolution in [2u32, 3, 64, 257] {
+            for u in [0.0f32, 0.1, 0.5, 0.999, 1.0] {
+                let uv = Vec2::new(u, 1.0 - u);
+                let mapped = colour_map_uv(uv, resolution);
+                assert_eq!(mapped.x, tint_uv(uv.x, resolution), "x at {resolution}");
+                assert_eq!(mapped.y, tint_uv(uv.y, resolution), "y at {resolution}");
+            }
+        }
+
+        let (resolution, scale) = (33u32, 4u8);
+        let side = crate::sidecar::side_for(resolution, scale);
+        let res = resolution as f32;
+        let texel_under =
+            |uv: f32| (colour_map_uv(Vec2::splat(uv), side).x * side as f32 - 0.5).round();
+        for i in 0..resolution {
+            let uv = i as f32 / (res - 1.0);
+            assert_eq!(
+                texel_under(uv),
+                f32::from(scale) * i as f32,
+                "grid point {i}"
+            );
+        }
     }
 }
