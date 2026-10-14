@@ -96,6 +96,14 @@ fn the_tint_operators_are_registered_under_their_ids() {
             "terrain.material.blend_sharpness",
             "Terrain Blend Sharpness",
         ),
+        ("terrain.material.near_distance", "Terrain Near Distance"),
+        ("terrain.material.far_distance", "Terrain Far Distance"),
+        ("terrain.material.relief_depth", "Terrain Relief Depth"),
+        ("terrain.material.grain", "Terrain Grain"),
+        (
+            "terrain.material.texture_colour",
+            "Terrain Material Texture Colour",
+        ),
     ] {
         let labels = util::operator_labels(&mut app, id);
         assert_eq!(labels, [expected], "{id} is not registered exactly once");

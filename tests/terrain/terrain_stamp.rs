@@ -394,4 +394,71 @@ mod tint {
             1.0
         );
     }
+
+    /// The near and far bands, the relief and the grain reach the document the
+    /// same way, clamp into the sidecar's ranges, and come back one undo at a
+    /// time.
+    #[test]
+    fn the_band_dials_reach_the_terrain_document_clamp_and_undo() {
+        let mut app = terrain_app();
+        let (_, terrain) = the_terrain(&mut app);
+        let data_path = terrain.data_path.clone();
+        let surface = |app: &App| {
+            app.world()
+                .resource::<TerrainDataStore>()
+                .surface(&data_path)
+        };
+        let set = |app: &mut App, id: &'static str, value: f64| {
+            let result = app
+                .world_mut()
+                .operator(id)
+                .param("value", value)
+                .call()
+                .unwrap_or_else(|err| panic!("{id} dispatch errored: {err}"));
+            assert_eq!(result, OperatorResult::Finished, "{id} did not finish");
+            app.update();
+        };
+
+        let untouched = surface(&app);
+        assert_eq!(
+            untouched.near_distance, 30.0,
+            "the defaults a file loads at"
+        );
+        assert_eq!(untouched.far_distance, 150.0);
+        assert_eq!(untouched.relief_depth, 0.0);
+        assert_eq!(untouched.grain, 0.0);
+
+        set(&mut app, "terrain.material.near_distance", 45.0);
+        set(&mut app, "terrain.material.far_distance", 400.0);
+        set(&mut app, "terrain.material.relief_depth", 0.125);
+        set(&mut app, "terrain.material.grain", 0.5);
+        let now = surface(&app);
+        assert_eq!(now.near_distance, 45.0);
+        assert_eq!(now.far_distance, 400.0);
+        assert_eq!(now.relief_depth, 0.125);
+        assert_eq!(now.grain, 0.5);
+        assert_eq!(
+            now.blend_sharpness, untouched.blend_sharpness,
+            "a band dial moves nothing but itself"
+        );
+
+        // Out of range clamps rather than reaching the shader.
+        set(&mut app, "terrain.material.near_distance", 1e9);
+        set(&mut app, "terrain.material.far_distance", -5.0);
+        set(&mut app, "terrain.material.relief_depth", 3.0);
+        set(&mut app, "terrain.material.grain", 7.0);
+        let clamped = surface(&app);
+        assert_eq!(clamped.near_distance, 2000.0);
+        assert_eq!(clamped.far_distance, 0.0, "0 is no far band");
+        assert_eq!(clamped.relief_depth, 0.5);
+        assert_eq!(clamped.grain, 1.0);
+
+        // One undo takes back the last dial and no other.
+        dispatch(&mut app, "history.undo");
+        app.update();
+        let undone = surface(&app);
+        assert_eq!(undone.grain, 0.5);
+        assert_eq!(undone.relief_depth, 0.5);
+        assert_eq!(undone.far_distance, 0.0);
+    }
 }

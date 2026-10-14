@@ -1,6 +1,7 @@
 //! Operators for the terrain colour layer: what the tint brush is loaded
-//! with, a parametric stamp of it, the whole-layer noise wash, and the two
-//! surface dials the splat material shades by.
+//! with, a parametric stamp of it, the whole-layer noise wash, and the surface
+//! dials the splat material shades by: the tint strength, the blend sharpness,
+//! and the near and far bands with the relief and grain that belong to them.
 //!
 //! The layer lives in [`TerrainDataStore`] beside the heights, so none of
 //! this touches the scene document. Anything that changes what the terrain
@@ -22,7 +23,11 @@ pub(crate) fn add_to_extension(ctx: &mut ExtensionContext) {
         .register_operator::<TerrainTintStampOp>()
         .register_operator::<TerrainTintVariationOp>()
         .register_operator::<TerrainTintStrengthOp>()
-        .register_operator::<TerrainMaterialBlendSharpnessOp>();
+        .register_operator::<TerrainMaterialBlendSharpnessOp>()
+        .register_operator::<TerrainMaterialNearDistanceOp>()
+        .register_operator::<TerrainMaterialFarDistanceOp>()
+        .register_operator::<TerrainMaterialReliefDepthOp>()
+        .register_operator::<TerrainMaterialGrainOp>();
 }
 
 /// A `0..1` float parameter as an 8-bit colour channel.
@@ -331,6 +336,132 @@ pub(crate) fn terrain_material_blend_sharpness(
             "terrain.material.blend_sharpness",
             "Terrain Blend Sharpness",
             |surface, value| surface.blend_sharpness = value,
+        );
+    });
+    OperatorResult::Finished
+}
+
+/// Set how far from the camera a terrain keeps its near detail.
+///
+/// Within the distance the ground gains its parallax relief and fine grain, and
+/// the planes of a cliff blend softly; the detail fades out over the next third.
+/// Authored per terrain, in the sidecar's surface block.
+#[operator(
+    id = "terrain.material.near_distance",
+    label = "Terrain Near Distance",
+    description = "Set how close to the camera a terrain shows its parallax relief and fine grain.",
+    allows_undo = false,
+    params(
+        terrain(String, doc = "Name of the terrain entity. Defaults to the selection."),
+        value(f64, doc = "Distance in metres, 0 (no near detail) to 2000."),
+    )
+)]
+pub(crate) fn terrain_material_near_distance(
+    params: In<OperatorParameters>,
+    mut commands: Commands,
+) -> OperatorResult {
+    let params = params.0;
+    commands.queue(move |world: &mut World| {
+        set_surface(
+            world,
+            &params,
+            "terrain.material.near_distance",
+            "Terrain Near Distance",
+            |surface, value| surface.near_distance = value,
+        );
+    });
+    OperatorResult::Finished
+}
+
+/// Set how far from the camera a terrain stops reading its detail maps.
+///
+/// Past the distance the ground draws each material's average normal, occlusion
+/// and roughness instead of sampling its maps, which is what keeps distant
+/// ground cheap; it fades in over the next third.
+#[operator(
+    id = "terrain.material.far_distance",
+    label = "Terrain Far Distance",
+    description = "Set how far from the camera a terrain stops reading its normal, occlusion and roughness maps.",
+    allows_undo = false,
+    params(
+        terrain(String, doc = "Name of the terrain entity. Defaults to the selection."),
+        value(f64, doc = "Distance in metres, 0 (never) to 20000."),
+    )
+)]
+pub(crate) fn terrain_material_far_distance(
+    params: In<OperatorParameters>,
+    mut commands: Commands,
+) -> OperatorResult {
+    let params = params.0;
+    commands.queue(move |world: &mut World| {
+        set_surface(
+            world,
+            &params,
+            "terrain.material.far_distance",
+            "Terrain Far Distance",
+            |surface, value| surface.far_distance = value,
+        );
+    });
+    OperatorResult::Finished
+}
+
+/// Set how deep a terrain's parallax relief reaches below its surface.
+///
+/// Only a material with a height map of its own has relief to show, and only
+/// within the near distance.
+#[operator(
+    id = "terrain.material.relief_depth",
+    label = "Terrain Relief Depth",
+    description = "Set how deep the parallax relief of a terrain's materials reaches below the ground.",
+    allows_undo = false,
+    params(
+        terrain(String, doc = "Name of the terrain entity. Defaults to the selection."),
+        value(f64, doc = "Depth in metres, 0 (off) to 0.5."),
+    )
+)]
+pub(crate) fn terrain_material_relief_depth(
+    params: In<OperatorParameters>,
+    mut commands: Commands,
+) -> OperatorResult {
+    let params = params.0;
+    commands.queue(move |world: &mut World| {
+        set_surface(
+            world,
+            &params,
+            "terrain.material.relief_depth",
+            "Terrain Relief Depth",
+            |surface, value| surface.relief_depth = value,
+        );
+    });
+    OperatorResult::Finished
+}
+
+/// Set how much of the textures' fine grain a terrain lays over its colour map.
+///
+/// A colour map is far coarser than the textures it colours; up close, the grain
+/// brings their detail back over it.
+#[operator(
+    id = "terrain.material.grain",
+    label = "Terrain Grain",
+    description = "Set how much of the textures' fine grain a terrain shows over its colour map up close.",
+    allows_undo = false,
+    params(
+        terrain(String, doc = "Name of the terrain entity. Defaults to the selection."),
+        value(f64, doc = "Grain, 0 (off) to 1."),
+    )
+)]
+pub(crate) fn terrain_material_grain(
+    params: In<OperatorParameters>,
+    mut commands: Commands,
+) -> OperatorResult {
+    let params = params.0;
+    commands.queue(move |world: &mut World| {
+        set_surface(
+            world,
+            &params,
+            "terrain.material.grain",
+            "Terrain Grain",
+            |surface, value| surface.grain = value,
         );
     });
     OperatorResult::Finished

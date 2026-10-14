@@ -17,7 +17,8 @@ use bevy::prelude::*;
 use jackdaw_api::prelude::*;
 use jackdaw_terrain::sidecar::{AutoTerrainSettings, TerrainMaterialSlot};
 use jackdaw_terrain::texture_set::{
-    DEFAULT_UV_SCALE, MAX_DETILE, MAX_SLOT_ROUGHNESS, MAX_UV_SCALE, MIN_UV_SCALE,
+    DEFAULT_TEXTURE_COLOUR, DEFAULT_UV_SCALE, MAX_DETILE, MAX_SLOT_ROUGHNESS, MAX_UV_SCALE,
+    MIN_UV_SCALE,
 };
 use path_slash::PathExt as _;
 
@@ -39,6 +40,7 @@ pub(crate) fn add_to_extension(ctx: &mut ExtensionContext) {
         .register_operator::<TerrainMaterialMoveOp>()
         .register_operator::<TerrainMaterialUvScaleOp>()
         .register_operator::<TerrainMaterialDetileOp>()
+        .register_operator::<TerrainMaterialTextureColourOp>()
         .register_operator::<TerrainMaterialRoughnessOp>()
         .register_operator::<TerrainMaterialReflectanceOp>()
         .register_operator::<TerrainMaterialPickerOp>()
@@ -428,6 +430,63 @@ pub(crate) fn terrain_material_detile(
         materials,
         None,
         "Terrain Material Detiling",
+    )
+}
+
+/// Set how much of its own colour one slot keeps against the terrain's colour
+/// map.
+///
+/// Held on the slot for the same reason as `terrain.material.uv_scale`: the
+/// colour a texture contributes is a property of how it is laid on this
+/// terrain. 1 draws the texture as it is, which is how a terrain with no colour
+/// map draws whatever this says; 0 takes the colour map's colour and keeps only
+/// the texture's light and dark.
+#[operator(
+    id = "terrain.material.texture_colour",
+    label = "Terrain Material Texture Colour",
+    description = "Set how much of its own colour one of the selected terrain's materials keeps against the terrain's colour map.",
+    is_available = has_selected_terrain,
+    allows_undo = false,
+    params(
+        index(i64, doc = "Texture id to set."),
+        value(f64, doc = "Texture colour, 0 (the colour map's colour, with the texture's light and dark) to 1 (the texture as it is)."),
+    ),
+)]
+pub(crate) fn terrain_material_texture_colour(
+    params: In<OperatorParameters>,
+    selection: Res<Selection>,
+    terrains: Query<&jackdaw_scene_types::Terrain>,
+    mut store: ResMut<TerrainDataStore>,
+    mut picker: ResMut<TerrainMaterialPicker>,
+    mut history: ResMut<CommandHistory>,
+) -> OperatorResult {
+    let data_path = selected_data_path(&selection, &terrains)?;
+    let index = params.as_int("index")? as usize;
+    let value = params.as_float("value")? as f32;
+    let mut materials = store.materials(&data_path).to_vec();
+    let Some(slot) = materials.get_mut(index) else {
+        picker.error = Some(TerrainMaterialError::NoSuchSlot(index).to_string());
+        return OperatorResult::Cancelled;
+    };
+    if slot.is_tombstone() {
+        picker.error = Some(TerrainMaterialError::EmptySlot(index).to_string());
+        return OperatorResult::Cancelled;
+    }
+    // Clamped rather than refused: the value arrives from a slider drag.
+    // Non-finite goes back to keeping the slot's own colour.
+    slot.texture_colour = if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_TEXTURE_COLOUR
+    };
+    commit(
+        &mut store,
+        &mut history,
+        &mut picker,
+        data_path,
+        materials,
+        None,
+        "Terrain Material Texture Colour",
     )
 }
 
@@ -1432,6 +1491,86 @@ mod tests {
         let _ = run(&mut world, false, None);
         assert_eq!(slot(&world).perceptual_roughness, None);
         assert_eq!(slot(&world).reflectance, Some(1.0));
+    }
+
+    /// A slot's texture colour starts at 1, takes a clamped value, resets on a
+    /// non-finite one, and undoes like any other list edit.
+    #[test]
+    fn texture_colour_lands_on_the_slot_is_clamped_and_undoes() {
+        let mut world = world_with_terrain("zone.jdterrain");
+        let _ = add(&mut world, "grass");
+        let set = |world: &mut World, value: f64| {
+            world
+                .run_system_cached_with(
+                    terrain_material_texture_colour,
+                    params(&[
+                        ("index", PropertyValue::Int(0)),
+                        ("value", PropertyValue::Float(value)),
+                    ]),
+                )
+                .expect("system runs")
+        };
+        let colour = |world: &World| {
+            world
+                .resource::<TerrainDataStore>()
+                .materials("zone.jdterrain")[0]
+                .texture_colour
+        };
+
+        assert_eq!(colour(&world), 1.0, "a fresh slot keeps its own colour");
+        assert_eq!(set(&mut world, 0.25), OperatorResult::Finished);
+        assert_eq!(colour(&world), 0.25);
+
+        let _ = set(&mut world, -2.0);
+        assert_eq!(colour(&world), 0.0, "the colour map's alone is the floor");
+        let _ = set(&mut world, 9.0);
+        assert_eq!(colour(&world), 1.0);
+        let _ = set(&mut world, 0.5);
+        let _ = set(&mut world, f64::NAN);
+        assert_eq!(colour(&world), 1.0, "NaN keeps the slot's own colour");
+
+        let mut command = world
+            .resource_mut::<CommandHistory>()
+            .undo_stack
+            .pop()
+            .expect("the change pushed a history entry");
+        command.undo(&mut world);
+        assert_eq!(colour(&world), 0.5, "one undo takes back the last change");
+    }
+
+    /// A vacated id has no material to take a colour from, and is refused by
+    /// name like the other slot dials.
+    #[test]
+    fn texture_colour_on_a_vacated_id_is_refused_by_name() {
+        let mut world = world_with_terrain("zone.jdterrain");
+        let _ = add(&mut world, "grass");
+        let _ = add(&mut world, "rock");
+        let _ = world
+            .run_system_cached_with(
+                terrain_material_remove,
+                params(&[("index", PropertyValue::Int(0))]),
+            )
+            .expect("system runs");
+
+        let result = world
+            .run_system_cached_with(
+                terrain_material_texture_colour,
+                params(&[
+                    ("index", PropertyValue::Int(0)),
+                    ("value", PropertyValue::Float(0.5)),
+                ]),
+            )
+            .expect("system runs");
+        assert_eq!(result, OperatorResult::Cancelled);
+        assert!(
+            world
+                .resource::<TerrainMaterialPicker>()
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("texture id 0")),
+            "{:?}",
+            world.resource::<TerrainMaterialPicker>().error,
+        );
     }
 
     /// Detiling a vacated id is refused the same way retiling one is:

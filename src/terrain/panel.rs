@@ -42,7 +42,8 @@ use super::splat::TerrainSplatMaterials;
 use super::texture_ops::{
     TerrainMaterialAddOp, TerrainMaterialDetileOp, TerrainMaterialMoveOp, TerrainMaterialPicker,
     TerrainMaterialPickerOp, TerrainMaterialReflectanceOp, TerrainMaterialRemoveOp,
-    TerrainMaterialRoughnessOp, TerrainMaterialUvScaleOp, TerrainTextureSelectOp,
+    TerrainMaterialRoughnessOp, TerrainMaterialTextureColourOp, TerrainMaterialUvScaleOp,
+    TerrainTextureSelectOp,
 };
 use super::ui_fields::{
     FieldKind, TerrainDefaultFontRoot, spawn_checkbox, spawn_error_hint, spawn_hint,
@@ -71,8 +72,10 @@ pub(super) fn plugin(app: &mut App) {
                 sync_gen_fields,
                 sync_material_uv_fields,
                 sync_material_detile_fields,
+                sync_material_colour_fields,
                 sync_slot_surface_fields,
                 sync_autoterrain_fields,
+                sync_ground_fields,
             )
                 .chain()
                 .run_if(in_state(crate::AppState::Editor)),
@@ -83,6 +86,7 @@ pub(super) fn plugin(app: &mut App) {
         .add_observer(on_gen_value_change)
         .add_observer(on_material_uv_change)
         .add_observer(on_material_detile_change)
+        .add_observer(on_material_colour_change)
         .add_observer(on_slot_surface_slider_change)
         .add_observer(on_slot_surface_toggle_change)
         .add_observer(on_autoterrain_slider_change)
@@ -780,10 +784,10 @@ fn spawn_autoterrain_section(
     );
 }
 
-/// The Ground Shading section: the two dials that shade the whole terrain
-/// rather than any one slot.
+/// The Ground Shading section: the dials that shade the whole terrain rather
+/// than any one slot.
 ///
-/// Both live in the sidecar's surface block, so they are the terrain's own
+/// All of them live in the sidecar's surface block, so they are the terrain's own
 /// look and travel with it into a built game.
 fn spawn_ground_section(
     commands: &mut Commands,
@@ -817,6 +821,55 @@ fn spawn_ground_section(
         UNIT_RANGE,
         FieldKind::Continuous,
         GroundField::TintStrength,
+    );
+    spawn_slider_row(
+        commands,
+        section.body,
+        "Near Distance",
+        "How close to the camera, in metres, the ground shows its parallax relief and \
+         fine grain, and blends the planes of a cliff softly. The detail fades out over \
+         the next third of the distance. 0 turns the near detail off",
+        surface.near_distance,
+        NEAR_RANGE,
+        FieldKind::Count,
+        GroundField::NearDistance,
+    );
+    spawn_slider_row(
+        commands,
+        section.body,
+        "Far Distance",
+        "How far from the camera, in metres, the ground stops reading its normal, \
+         occlusion and roughness maps and draws each material's average instead, which \
+         keeps distant ground cheap. It fades in over the next third of the distance. \
+         0 turns it off",
+        surface.far_distance,
+        FAR_RANGE,
+        FieldKind::Count,
+        GroundField::FarDistance,
+    );
+    spawn_slider_row(
+        commands,
+        section.body,
+        "Relief Depth",
+        "How deep, in metres, the parallax relief reaches below the ground within the \
+         near distance. It marches through the height map of the material that covers \
+         the ground, so it shows only on materials that have one. 0 turns it off",
+        surface.relief_depth,
+        RELIEF_RANGE,
+        FieldKind::Continuous,
+        GroundField::ReliefDepth,
+    );
+    spawn_slider_row(
+        commands,
+        section.body,
+        "Grain",
+        "How much of the textures' own fine grain shows over a colour map within the \
+         near distance, for a material that has given up its colour to the map. 0 turns \
+         it off",
+        surface.grain,
+        UNIT_RANGE,
+        FieldKind::Continuous,
+        GroundField::Grain,
     );
 }
 
@@ -1692,6 +1745,19 @@ fn spawn_slot_editor(
         FieldKind::Continuous,
         MaterialDetileField(index),
     );
+    spawn_slider_row(
+        commands,
+        slot_section.body,
+        "Texture Colour",
+        "How much of this material's own colour shows where the terrain has a colour \
+         map. 1 draws the texture as it is; 0 takes the colour map's colour and keeps \
+         only the texture's light and dark. A terrain with no colour map draws the \
+         texture either way",
+        slot.texture_colour,
+        UNIT_RANGE,
+        FieldKind::Continuous,
+        MaterialColourField(index),
+    );
     let has_roughness_map = !slot.roughness.is_empty()
         || refs
             .materials
@@ -1802,14 +1868,57 @@ const GROUND_SECTION: MaterialSection = MaterialSection::new(
 /// The whole slope range: 0 is level ground and 90 is a wall.
 const SLOPE_RANGE: std::ops::Range<f32> = 0.0..90.0;
 
-/// Both surface dials are authored 0..1.
+/// The unit dials are authored 0..1.
 const UNIT_RANGE: std::ops::Range<f32> = 0.0..1.0;
 
-/// Which of the two whole-terrain shading dials a slider row drives.
+/// Practical ranges for the slider, in metres. Narrower than the sidecar's
+/// bounds, which the operators clamp to: a slider has no typed-entry escape
+/// hatch, and a linear one over the full range would spend its whole travel
+/// below the default.
+const NEAR_RANGE: std::ops::Range<f32> = 0.0..200.0;
+const FAR_RANGE: std::ops::Range<f32> = 0.0..1000.0;
+/// The relief is bounded at half a metre by the sidecar, which is already a
+/// deep shell.
+const RELIEF_RANGE: std::ops::Range<f32> = 0.0..jackdaw_terrain::sidecar::MAX_RELIEF_DEPTH;
+
+/// Which of the whole-terrain shading dials a slider row drives.
 #[derive(Component, Clone, Copy)]
 enum GroundField {
     BlendSharpness,
     TintStrength,
+    NearDistance,
+    FarDistance,
+    ReliefDepth,
+    Grain,
+}
+
+impl GroundField {
+    fn operator(self) -> &'static str {
+        use crate::terrain::tint_ops::{
+            TerrainMaterialBlendSharpnessOp, TerrainMaterialFarDistanceOp, TerrainMaterialGrainOp,
+            TerrainMaterialNearDistanceOp, TerrainMaterialReliefDepthOp, TerrainTintStrengthOp,
+        };
+        match self {
+            Self::BlendSharpness => TerrainMaterialBlendSharpnessOp::ID,
+            Self::TintStrength => TerrainTintStrengthOp::ID,
+            Self::NearDistance => TerrainMaterialNearDistanceOp::ID,
+            Self::FarDistance => TerrainMaterialFarDistanceOp::ID,
+            Self::ReliefDepth => TerrainMaterialReliefDepthOp::ID,
+            Self::Grain => TerrainMaterialGrainOp::ID,
+        }
+    }
+
+    /// What the store holds for this dial.
+    fn of(self, surface: &jackdaw_terrain::sidecar::SurfaceSettings) -> f32 {
+        match self {
+            Self::BlendSharpness => surface.blend_sharpness,
+            Self::TintStrength => surface.tint_strength,
+            Self::NearDistance => surface.near_distance,
+            Self::FarDistance => surface.far_distance,
+            Self::ReliefDepth => surface.relief_depth,
+            Self::Grain => surface.grain,
+        }
+    }
 }
 
 fn on_ground_slider_change(
@@ -1820,20 +1929,37 @@ fn on_ground_slider_change(
     let Ok(field) = fields.get(event.event_target()) else {
         return;
     };
-    let op_id = match field {
-        GroundField::BlendSharpness => {
-            crate::terrain::tint_ops::TerrainMaterialBlendSharpnessOp::ID
-        }
-        GroundField::TintStrength => crate::terrain::tint_ops::TerrainTintStrengthOp::ID,
-    };
     commands
-        .operator(op_id)
+        .operator(field.operator())
         .param("value", event.value as f64)
         .settings(CallOperatorSettings {
             creates_history_entry: true,
             execution_context: ExecutionContext::Invoke,
         })
         .call();
+}
+
+/// [`sync_autoterrain_fields`] for the ground dials: an undo or a scripted call
+/// lands on the slider the same as a drag does.
+fn sync_ground_fields(
+    store: Res<TerrainDataStore>,
+    selection: Res<Selection>,
+    terrains: Query<&jackdaw_scene_types::Terrain>,
+    fields: Query<(Entity, &GroundField)>,
+    mut commands: Commands,
+) {
+    if !store.is_changed() || fields.is_empty() {
+        return;
+    }
+    let Some(terrain) = selection.primary().and_then(|e| terrains.get(e).ok()) else {
+        return;
+    };
+    let surface = store.surface(&terrain.data_path);
+    for (entity, field) in &fields {
+        commands
+            .entity(entity)
+            .insert(SliderValue(field.of(&surface)));
+    }
 }
 
 /// Which end of the autoterrain slope band a slider row drives.
@@ -1968,6 +2094,10 @@ struct MaterialUvField(usize);
 /// Which slot's detiling a slider row drives.
 #[derive(Component, Clone, Copy)]
 struct MaterialDetileField(usize);
+
+/// Which slot's texture colour a slider row drives.
+#[derive(Component, Clone, Copy)]
+struct MaterialColourField(usize);
 
 /// One of the shading values a slot may set of its own.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2179,6 +2309,25 @@ fn on_material_detile_change(
         .call();
 }
 
+fn on_material_colour_change(
+    event: On<ValueChange<f32>>,
+    fields: Query<&MaterialColourField>,
+    mut commands: Commands,
+) {
+    let Ok(field) = fields.get(event.event_target()) else {
+        return;
+    };
+    commands
+        .operator(TerrainMaterialTextureColourOp::ID)
+        .param("index", field.0 as i64)
+        .param("value", event.value as f64)
+        .settings(CallOperatorSettings {
+            creates_history_entry: true,
+            execution_context: ExecutionContext::Invoke,
+        })
+        .call();
+}
+
 /// Pushes the stored tiling back onto its slider whenever the store changes: an
 /// undo, a scripted call, or an intermediate tick of a drag, so the fill tracks
 /// the gesture rather than snapping into place on release.
@@ -2221,6 +2370,30 @@ fn sync_material_detile_fields(
     for (entity, field) in &fields {
         if let Some(slot) = slots.get(field.0) {
             commands.entity(entity).insert(SliderValue(slot.detile));
+        }
+    }
+}
+
+/// [`sync_material_uv_fields`] for the texture colour row.
+fn sync_material_colour_fields(
+    store: Res<TerrainDataStore>,
+    selection: Res<Selection>,
+    terrains: Query<&jackdaw_scene_types::Terrain>,
+    fields: Query<(Entity, &MaterialColourField)>,
+    mut commands: Commands,
+) {
+    if !store.is_changed() || fields.is_empty() {
+        return;
+    }
+    let Some(terrain) = selection.primary().and_then(|e| terrains.get(e).ok()) else {
+        return;
+    };
+    let slots = store.materials(&terrain.data_path);
+    for (entity, field) in &fields {
+        if let Some(slot) = slots.get(field.0) {
+            commands
+                .entity(entity)
+                .insert(SliderValue(slot.texture_colour));
         }
     }
 }
