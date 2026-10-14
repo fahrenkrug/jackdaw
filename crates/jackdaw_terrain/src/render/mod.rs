@@ -21,15 +21,21 @@
 //! from above, so a cliff is not a texture smeared down a slope. And a terrain
 //! may carry a colour map baked outside the editor ([`ColourMap`]), which gives
 //! the colour while the slot textures give their light and dark.
+//!
+//! The relief, the grain and the colour map are compiled into the shader only for
+//! a terrain that uses them: the material's pipeline is specialized on a
+//! [`TerrainSplatKey`], and a terrain with all three off pays for none of them.
 
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, Extent3d, TextureDataOrder, TextureDimension, TextureFormat,
-    TextureViewDescriptor, TextureViewDimension,
+    AsBindGroup, Extent3d, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    TextureDataOrder, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
 };
-use bevy::shader::ShaderRef;
+use bevy::shader::{ShaderDefVal, ShaderRef};
 use path_slash::PathExt as _;
 
 pub mod detail;
@@ -1083,12 +1089,72 @@ pub fn slope_image(map: &Heightmap) -> Image {
     image
 }
 
+/// What the splat pipeline is specialized on: which optional parts of the
+/// shader a material turns on.
+///
+/// A terrain with none of them compiles none of their code, and so pays for
+/// none of it on any fragment; the pipeline for a combination is built the
+/// first time a material asks for it. The key is read off the material when its
+/// bind group is prepared, so moving a dial across zero in the editor switches
+/// the variant and moving it anywhere else does not.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct TerrainSplatKey {
+    /// The relief depth is above 0: the near band marches parallax relief
+    /// (`TERRAIN_RELIEF`).
+    pub relief: bool,
+    /// The grain is above 0: the near band lays the textures' grain over the
+    /// colour map (`TERRAIN_GRAIN`).
+    pub grain: bool,
+    /// The terrain has a colour map: the shader samples it and mixes it with
+    /// each texture's own colour (`TERRAIN_COLOUR_MAP`).
+    pub colour_map: bool,
+}
+
+impl TerrainSplatKey {
+    /// The shader defs this key switches on, which `terrain_splat.wgsl` wraps
+    /// the optional code in.
+    ///
+    /// `TERRAIN_DOMINANT`, the choice of the texture the relief and the grain
+    /// are made from, is wanted by either and is a def of its own: the shader
+    /// cannot derive one, as a `#define` in it is read whatever scope it is in.
+    pub fn shader_defs(self) -> Vec<&'static str> {
+        let mut defs = Vec::new();
+        if self.relief {
+            defs.push("TERRAIN_RELIEF");
+        }
+        if self.grain {
+            defs.push("TERRAIN_GRAIN");
+        }
+        if self.relief || self.grain {
+            defs.push("TERRAIN_DOMINANT");
+        }
+        if self.colour_map {
+            defs.push("TERRAIN_COLOUR_MAP");
+        }
+        defs
+    }
+}
+
+impl From<&TerrainSplatMaterial> for TerrainSplatKey {
+    fn from(material: &TerrainSplatMaterial) -> Self {
+        Self {
+            relief: material.relief_depth > 0.0,
+            grain: material.grain > 0.0,
+            colour_map: material.colour_map_scale > 0,
+        }
+    }
+}
+
 /// Terrain shaded from a control map against a texture set.
 ///
 /// One material per terrain: the control map and terrain size live here rather
 /// than per chunk, so every chunk of a terrain shares one material and one
 /// upload.
+///
+/// The pipeline is specialized on a [`TerrainSplatKey`]: relief, grain and the
+/// colour map are compiled into the shader only for a material that uses them.
 #[derive(Asset, AsBindGroup, TypePath, Clone, Debug)]
+#[bind_group_data(TerrainSplatKey)]
 pub struct TerrainSplatMaterial {
     /// Per-id UV scales, four to a `Vec4`. The shader unpacks by id.
     #[uniform(0)]
@@ -1222,6 +1288,25 @@ pub struct TerrainSplatMaterial {
 impl Material for TerrainSplatMaterial {
     fn fragment_shader() -> ShaderRef {
         SHADER_PATH.into()
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        // Some of the pipelines that specialize through here, a depth-only
+        // prepass among them, have no fragment stage to switch anything on in.
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.shader_defs.extend(
+                key.bind_group_data
+                    .shader_defs()
+                    .into_iter()
+                    .map(ShaderDefVal::from),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -3144,10 +3229,10 @@ mod tests {
         assert_eq!(material.slot_stats[2].x, 1.0);
         assert_eq!(material.slot_stats[3].x, 0.0);
         assert_eq!(material.slot_stats[4].x, 1.0, "past the list, the default");
-        for id in 0..MAX_TEXTURES {
+        for (id, (now, was)) in material.slot_stats.iter().zip(&before).enumerate() {
             assert_eq!(
-                material.slot_stats[id].to_array()[1..],
-                before[id].to_array()[1..],
+                now.to_array()[1..],
+                was.to_array()[1..],
                 "id {id}: only the texture colour moved"
             );
         }
@@ -3574,20 +3659,72 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
 }
 "#;
 
-    /// Compose the production splat shader and have naga validate it, with no
-    /// GPU: the types, the bindings, and the uniformity analysis that refuses an
-    /// implicit-derivative read (`textureSample`, `dpdx`) in divergent control
-    /// flow. A shader error otherwise surfaces only when the first frame builds
-    /// the pipeline.
+    /// The key a combination of the three flags is, by the bits of `bits`.
+    fn key_of(bits: u8) -> TerrainSplatKey {
+        TerrainSplatKey {
+            relief: bits & 1 != 0,
+            grain: bits & 2 != 0,
+            colour_map: bits & 4 != 0,
+        }
+    }
+
+    /// Compose the production splat shader in every variant its key can ask
+    /// for, and have naga validate each, with no GPU: the types, the bindings,
+    /// and the uniformity analysis that refuses an implicit-derivative read
+    /// (`textureSample`, `dpdx`) in divergent control flow. A shader error
+    /// otherwise surfaces only when the first frame builds the pipeline.
     ///
     /// Only Bevy's own pieces are stubbed, and the shader's imports are cut,
     /// the way the Hayjump monorepo validates its prepass. The shader cache
     /// validates what it composes only with debug assertions on.
+    ///
+    /// The composed module is measured too, which is what shows that a variant
+    /// without a part really compiles none of it: its relief functions are
+    /// absent, and every part a variant adds makes the module bigger.
     #[cfg(debug_assertions)]
     #[test]
-    fn the_splat_shader_composes_and_validates_against_stubs_of_bevys_pieces() {
+    fn the_splat_shader_composes_and_validates_in_every_variant_against_stubs_of_bevys_pieces() {
         use bevy::render::render_resource::{DownlevelFlags, WgpuFeatures};
-        use bevy::shader::{Shader, ShaderCache, ShaderCacheError, ShaderDefVal};
+        use bevy::shader::{
+            Shader, ShaderCache, ShaderCacheError, ShaderCacheSource, ValidateShader,
+        };
+
+        /// What composing one variant came to: the functions it holds, and its
+        /// size in expressions across them and the entry point.
+        struct Variant {
+            functions: Vec<String>,
+            size: usize,
+        }
+
+        fn measure(
+            _: &(),
+            source: ShaderCacheSource,
+            _: &ValidateShader,
+        ) -> Result<Variant, ShaderCacheError> {
+            let ShaderCacheSource::Naga(module) = source else {
+                return Err(ShaderCacheError::CreateShaderModule(
+                    "expected a composed naga module".to_string(),
+                ));
+            };
+            Ok(Variant {
+                functions: module
+                    .functions
+                    .iter()
+                    .filter_map(|(_, function)| function.name.clone())
+                    .collect(),
+                size: module
+                    .functions
+                    .iter()
+                    .map(|(_, function)| function.expressions.len())
+                    .chain(
+                        module
+                            .entry_points
+                            .iter()
+                            .map(|entry| entry.function.expressions.len()),
+                    )
+                    .sum(),
+            })
+        }
 
         let import = SHADER_SOURCE
             .find("#import")
@@ -3608,23 +3745,164 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
         let mut assets = Assets::<Shader>::default();
         let shader = Shader::from_wgsl(source, "terrain-splat-test.wgsl");
         let handle = assets.add(shader.clone());
-        let mut cache = ShaderCache::new(
-            (),
-            WgpuFeatures::empty(),
-            DownlevelFlags::all(),
-            |_, _, _| Ok(()),
-        );
+        let mut cache = ShaderCache::new((), WgpuFeatures::empty(), DownlevelFlags::all(), measure);
         cache.set_shader(handle.id(), shader);
 
-        let definitions = [ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 2)];
-        if let Err(error) = cache.get(0, handle.id(), &definitions) {
-            let reason = match &error {
-                ShaderCacheError::ProcessShaderError(composed) => {
-                    composed.emit_to_string(&cache.composer)
+        let mut sizes = [0usize; 8];
+        for bits in 0..8u8 {
+            let key = key_of(bits);
+            let mut definitions = vec![ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 2)];
+            definitions.extend(key.shader_defs().into_iter().map(ShaderDefVal::from));
+            let variant = match cache.get(0, handle.id(), &definitions) {
+                Ok(variant) => variant,
+                Err(error) => {
+                    let reason = match &error {
+                        ShaderCacheError::ProcessShaderError(composed) => {
+                            composed.emit_to_string(&cache.composer)
+                        }
+                        other => format!("{other:?}"),
+                    };
+                    panic!("the splat shader does not compose for {key:?}:\n{reason}");
                 }
-                other => format!("{other:?}"),
             };
-            panic!("the splat shader does not compose:\n{reason}");
+            for function in ["relief_mip", "relief_gap", "relief_travel"] {
+                assert_eq!(
+                    variant.functions.iter().any(|name| name == function),
+                    key.relief,
+                    "{function} for {key:?}"
+                );
+            }
+            sizes[usize::from(bits)] = variant.size;
+        }
+
+        // Every part a variant adds is code it compiles, and none a variant
+        // lacks is: a superset of the parts is always the bigger module.
+        for fewer in 0..8usize {
+            for more in 0..8usize {
+                if fewer != more && fewer & more == fewer {
+                    assert!(
+                        sizes[more] > sizes[fewer],
+                        "{:?} is {} expressions, {:?} is {}",
+                        key_of(more as u8),
+                        sizes[more],
+                        key_of(fewer as u8),
+                        sizes[fewer]
+                    );
+                }
+            }
+        }
+    }
+
+    /// A terrain that uses none of the optional parts keys the plain pipeline,
+    /// and the key follows the dials that switch code and none of the others:
+    /// the relief depth, the grain and the colour map, and not the bands, the
+    /// blend or the tint.
+    #[test]
+    fn the_pipeline_key_follows_the_dials_that_switch_shader_code() {
+        let mut material = material_over(&TextureSet::default(), &[]);
+        let plain = TerrainSplatKey::from(&material);
+        assert_eq!(plain, TerrainSplatKey::default(), "the defaults use none");
+        assert!(plain.shader_defs().is_empty(), "so they compile none");
+
+        material.set_surface(SurfaceSettings {
+            relief_depth: 0.05,
+            ..SurfaceSettings::default()
+        });
+        assert_eq!(
+            TerrainSplatKey::from(&material),
+            TerrainSplatKey {
+                relief: true,
+                ..plain
+            }
+        );
+        material.set_surface(SurfaceSettings {
+            grain: 0.5,
+            ..SurfaceSettings::default()
+        });
+        assert_eq!(
+            TerrainSplatKey::from(&material),
+            TerrainSplatKey {
+                grain: true,
+                ..plain
+            },
+            "the relief went back to 0 with the rest of the surface"
+        );
+        material.set_colour_map(ColourMapBinding {
+            image: Handle::default(),
+            scale: 2,
+            side: 9,
+        });
+        assert_eq!(
+            TerrainSplatKey::from(&material),
+            TerrainSplatKey {
+                grain: true,
+                colour_map: true,
+                ..plain
+            }
+        );
+        material.set_colour_map(ColourMapBinding::default());
+        material.set_surface(SurfaceSettings::default());
+        assert_eq!(TerrainSplatKey::from(&material), plain, "all of it undone");
+
+        // What changes a look without changing code leaves the pipeline alone.
+        material.set_surface(SurfaceSettings {
+            blend_sharpness: 0.9,
+            tint_strength: 0.1,
+            near_distance: 500.0,
+            far_distance: 0.0,
+            ..SurfaceSettings::default()
+        });
+        material.set_texture_colours(&[0.0]);
+        assert_eq!(TerrainSplatKey::from(&material), plain);
+
+        // A dial that is not a number is pulled back to its default, which is
+        // off, before it can switch anything on.
+        material.set_surface(SurfaceSettings {
+            relief_depth: f32::NAN,
+            grain: -3.0,
+            ..SurfaceSettings::default()
+        });
+        assert_eq!(TerrainSplatKey::from(&material), plain);
+    }
+
+    /// The defs the key switches on and the defs the shader wraps its code in
+    /// are one list: a def spelled differently on either side would compile
+    /// the part out for good, or leave it in for everyone.
+    #[test]
+    fn the_defs_the_key_sets_are_the_defs_the_shader_wraps() {
+        let mut set: Vec<&str> = (0..8u8)
+            .flat_map(|bits| key_of(bits).shader_defs())
+            .collect();
+        set.sort_unstable();
+        set.dedup();
+        assert_eq!(
+            set,
+            [
+                "TERRAIN_COLOUR_MAP",
+                "TERRAIN_DOMINANT",
+                "TERRAIN_GRAIN",
+                "TERRAIN_RELIEF"
+            ]
+        );
+
+        let mut wrapped: Vec<&str> = SHADER_SOURCE
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("#ifdef "))
+            .map(str::trim)
+            .collect();
+        wrapped.sort_unstable();
+        wrapped.dedup();
+        assert_eq!(wrapped, set, "the shader wraps code in exactly these");
+
+        // Either part that needs the dominant texture turns the choice of it
+        // on, and nothing else does.
+        for bits in 0..8u8 {
+            let key = key_of(bits);
+            assert_eq!(
+                key.shader_defs().contains(&"TERRAIN_DOMINANT"),
+                key.relief || key.grain,
+                "{key:?}"
+            );
         }
     }
 }

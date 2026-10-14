@@ -38,6 +38,20 @@
 // what it always did. A fragment on a cliff reads a second plane. The relief
 // march is the only loop, and it runs only in the near band, on slots that have
 // a height map of their own, when the relief depth is set.
+//
+// Three optional parts are compiled only for a material that uses them, so a
+// terrain that has none of them pays for none of them. `TerrainSplatKey` in
+// render/mod.rs keys the pipeline on what the material has and sets the defs:
+//
+//   TERRAIN_RELIEF      relief depth above 0: the relief march
+//   TERRAIN_GRAIN       grain above 0: the grain read
+//   TERRAIN_COLOUR_MAP  a colour map: its sample, and the mix of it with the
+//                       texture's own colour
+//   TERRAIN_DOMINANT    either of the first two: the choice of the texture they
+//                       are made from
+//
+// The bands, the side projections and the far band's savings are in every
+// variant.
 
 #import bevy_pbr::{
     forward_io::{VertexOutput, FragmentOutput},
@@ -224,9 +238,10 @@ struct Frame {
     // side planes are the terrain's own axes, so their whiteout blend is done in
     // its space, and turned into world axes once at the end.
     local_normal: vec3<f32>,
-    // The colour map under the fragment, linear. White where the terrain has
-    // none.
+#ifdef TERRAIN_COLOUR_MAP
+    // The colour map under the fragment, linear.
     colour: vec3<f32>,
+#endif
 }
 
 var<private> frame: Frame;
@@ -587,6 +602,7 @@ fn accumulate(
         roughness_sample = mix(roughness_sample, stats.z, frame.far);
     }
 
+#ifdef TERRAIN_COLOUR_MAP
     // With a colour map the colour is the map's and the texture supplies only
     // its light and dark, relative to its own average, as far as the slot
     // gives up its colour. A slot that keeps all of it draws as it always did.
@@ -594,6 +610,7 @@ fn accumulate(
         let grainy = frame.colour * (luminance(albedo) / stats.y);
         albedo = mix(grainy, albedo, stats.x);
     }
+#endif
 
     let own_roughness = slot_roughness_for(layer_id);
     var roughness_scale = 1.0;
@@ -654,6 +671,7 @@ fn autoterrain_control(slope: f32) -> u32 {
         | ((blend & BLEND_MASK) << BLEND_SHIFT);
 }
 
+#ifdef TERRAIN_RELIEF
 // The mip level an isotropic filter would read a height map at, from the
 // derivatives of the coordinates it is read with: the longer of the two screen
 // axes, in texels.
@@ -747,6 +765,7 @@ fn relief_travel(
     // than punch a hole in the surface.
     return previous;
 }
+#endif
 
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
@@ -797,6 +816,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let tint_uv = (in.uv * (tint_res - 1.0) + 0.5) / tint_res;
     let tint = textureSample(tint_map, tint_sampler, tint_uv).rgb;
 
+#ifdef TERRAIN_COLOUR_MAP
     // The colour map is laid out the same way over its own, finer grid: texel
     // `scale * i` sits on grid point `i`. `render::colour_map_uv` spells the
     // same mapping in Rust. The branch is on a uniform, so the sample stays in
@@ -807,6 +827,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         let colour_uv = (in.uv * (colour_res - 1.0) + 0.5) / colour_res;
         frame.colour = textureSample(colour_map, colour_map_sampler, colour_uv).rgb;
     }
+#endif
 
     // The surface's normal, and the frame the top plane's normals are read in.
     //
@@ -957,6 +978,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         }
     }
 
+#ifdef TERRAIN_DOMINANT
     // The id with the largest share of the fragment, before the height blend
     // has a say. It is the one the relief and the grain are made from.
     var dominant = 0u;
@@ -971,6 +993,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let dominant_id = min(entry_ids[dominant], last_layer());
     let dominant_layer = i32(dominant_id);
     let dominant_scale = uv_scale_for(dominant_id);
+#endif
 
     // How many of those ids take any of the fragment at all. A corner share of
     // nothing on every corner, as on a grid line, is a set of reads that change
@@ -985,6 +1008,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
     let single = live == 1u;
 
+#ifdef TERRAIN_RELIEF
     // Parallax relief: march a ray from the eye into a shell of `relief_depth`
     // under the top plane, against the dominant texture's height map, and shift
     // the top plane's position, for every id, to where it met it. Colour and
@@ -1045,6 +1069,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             frame.top += xz_per_metre * (travel / max(shares, 1e-8));
         }
     }
+#endif
 
     var accum: Accum;
     accum.albedo = vec3<f32>(0.0);
@@ -1065,6 +1090,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let inv_total = 1.0 / max(accum.total, MIN_TOTAL_WEIGHT);
     var albedo = accum.albedo * inv_total;
 
+#ifdef TERRAIN_GRAIN
     // Grain: one more read of the dominant texture, at four times its tiling on
     // the plane that has most of the fragment, laid over the albedo as the
     // ratio of its light to the texture's average. It brings back the fine
@@ -1100,6 +1126,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             luminance(fine) / max(dominant_stats.y, GRAIN_MIN_LUMINANCE), 0.0, GRAIN_RATIO_MAX);
         albedo *= mix(1.0, ratio, grain);
     }
+#endif
 
     albedo *= mix(vec3<f32>(1.0), tint, splat.tint_strength);
     let occlusion = accum.occlusion * inv_total;
