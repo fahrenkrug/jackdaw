@@ -158,6 +158,36 @@ pub(super) fn bands(
     (near, far)
 }
 
+/// A filtered normal shorter than this points nowhere.
+/// `NORMAL_MAP_MIN_LENGTH_SQ` in the shader, squared.
+const NORMAL_MAP_MIN_LENGTH_SQ: f32 = 1e-4;
+
+/// The matrix the shader takes a terrain-space normal to world space with: the
+/// inverse transpose of the transform that moves positions, which is
+/// `local_from_world` transposed.
+pub(super) fn normal_to_world(local_from_world: Mat4) -> Mat3 {
+    Mat3::from_mat4(local_from_world).transpose()
+}
+
+/// `baked_normal` in the shader: the world-space normal a normal map texel
+/// stands for. The texel stores the terrain-space normal as `(x, z, y)`, linear
+/// bytes; `geometric` is the mesh's normal, which stands in for a texel that
+/// points nowhere.
+pub(super) fn baked_normal(texel: [u8; 4], normal_to_world: Mat3, geometric: Vec3) -> Vec3 {
+    let stored = Vec3::new(
+        f32::from(texel[0]),
+        f32::from(texel[1]),
+        f32::from(texel[2]),
+    ) / 255.0
+        * 2.0
+        - Vec3::ONE;
+    let local = Vec3::new(stored.x, stored.z, stored.y);
+    if local.length_squared() < NORMAL_MAP_MIN_LENGTH_SQ {
+        return geometric;
+    }
+    (normal_to_world * local).normalize()
+}
+
 /// One texture id as the shader reads it at a fragment: the share of each of the
 /// four corners that name it (zero for those that do not), and the weight the id
 /// has in each corner's control word.
@@ -627,6 +657,82 @@ mod tests {
         let one = merged.iter().find(|layer| layer.id == 1).expect("id 1");
         assert_eq!(one.corners, Vec4::new(0.0, 0.2, 0.0, 0.4));
         assert!(merged.len() <= 8);
+    }
+
+    /// The sidecar writes the terrain-space normal as `(x, z, y)` and the shader
+    /// reads it back the same way round: to within a byte, every direction comes
+    /// out the way it went in, and straight up is up.
+    #[test]
+    fn a_stored_normal_reads_back_as_the_terrain_normal_it_was() {
+        use crate::sidecar::{UP_NORMAL_TEXEL, normal_texel};
+
+        let up = baked_normal(UP_NORMAL_TEXEL, Mat3::IDENTITY, Vec3::X);
+        assert!(up.abs_diff_eq(Vec3::Y, 0.01), "{up}");
+
+        for normal in [
+            Vec3::new(0.6, 0.8, 0.0),
+            Vec3::new(-0.6, 0.8, 0.0),
+            Vec3::new(0.0, 0.8, 0.6),
+            Vec3::new(0.0, 0.8, -0.6),
+            Vec3::new(0.3, 0.5, -0.4).normalize(),
+            Vec3::new(1.0, 0.1, 0.0).normalize(),
+        ] {
+            let read = baked_normal(normal_texel(normal), Mat3::IDENTITY, Vec3::Y);
+            assert!(
+                read.abs_diff_eq(normal, 0.01),
+                "stored {normal}, read back {read}"
+            );
+        }
+    }
+
+    /// A terrain turned about Y, or stretched, takes the baked normal to world
+    /// space with the transform that moves normals: still square to the surface
+    /// the normal describes, which a plain rotation by the transform's matrix
+    /// would lose once the terrain is scaled unevenly.
+    #[test]
+    fn a_turned_and_stretched_terrain_keeps_the_baked_normal_square_to_its_surface() {
+        use crate::sidecar::normal_texel;
+
+        // A 45 degree slope rising toward +X in terrain space.
+        let slope = Vec3::new(-1.0, 1.0, 0.0).normalize();
+        let along = Vec3::new(1.0, 1.0, 0.0);
+        let texel = normal_texel(slope);
+
+        for world_from_local in [
+            Mat4::IDENTITY,
+            Mat4::from_rotation_y(50.0_f32.to_radians()),
+            Mat4::from_scale(Vec3::new(2.0, 1.0, 1.0)),
+            Mat4::from_translation(Vec3::new(5.0, -2.0, 7.0))
+                * Mat4::from_rotation_y(-70.0_f32.to_radians())
+                * Mat4::from_scale(Vec3::new(3.0, 0.5, 2.0)),
+        ] {
+            let matrix = normal_to_world(world_from_local.inverse());
+            let world = baked_normal(texel, matrix, Vec3::Y);
+            assert!((world.length() - 1.0).abs() < 1e-5, "{world}");
+            // The surface runs along `along` in the terrain; it has moved with
+            // the terrain's transform, and the normal must still be square to it.
+            let world_along = world_from_local.transform_vector3(along);
+            assert!(
+                world.dot(world_along.normalize()).abs() < 0.01,
+                "{world} against the surface direction {world_along}"
+            );
+        }
+    }
+
+    /// Opposite normals filtered to nothing, which bytes can only say as mid-grey
+    /// on every channel, leave the mesh's own normal to stand in and not a NaN.
+    #[test]
+    fn a_normal_that_points_nowhere_falls_back_to_the_meshs() {
+        let geometric = Vec3::new(0.0, 0.6, 0.8);
+        for grey in [127u8, 128] {
+            assert_eq!(
+                baked_normal([grey, grey, grey, 255], Mat3::IDENTITY, geometric),
+                geometric
+            );
+        }
+        // Up is a direction, and the mesh's normal has no say in it.
+        let up = baked_normal([128, 128, 255, 255], Mat3::IDENTITY, geometric);
+        assert!(up.abs_diff_eq(Vec3::Y, 0.01), "{up}");
     }
 
     /// Every word draws at least one layer, or a fragment would normalise zero

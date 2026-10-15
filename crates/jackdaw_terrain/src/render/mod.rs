@@ -20,11 +20,14 @@
 //! averages ([`SlotStats`]). Steep ground is projected from the sides as well as
 //! from above, so a cliff is not a texture smeared down a slope. And a terrain
 //! may carry a colour map baked outside the editor ([`ColourMap`]), which gives
-//! the colour while the slot textures give their light and dark.
+//! the colour while the slot textures give their light and dark, and a normal map
+//! baked the same way, finer than the grid, which the surface is lit from per
+//! pixel in place of the mesh's normal.
 //!
-//! The relief, the grain and the colour map are compiled into the shader only for
-//! a terrain that uses them: the material's pipeline is specialized on a
-//! [`TerrainSplatKey`], and a terrain with all three off pays for none of them.
+//! The relief, the grain, the colour map and the normal map are compiled into the
+//! shader only for a terrain that uses them: the material's pipeline is
+//! specialized on a [`TerrainSplatKey`], and a terrain with all four off pays for
+//! none of them.
 
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -57,7 +60,9 @@ pub use scatter::{
 };
 
 use crate::heightmap::Heightmap;
-use crate::sidecar::{AutoTerrainSettings, ColourMap, SurfaceSettings, TerrainMaterialSlot};
+use crate::sidecar::{
+    AutoTerrainSettings, ColourMap, SurfaceSettings, TerrainMaterialSlot, UP_NORMAL_TEXEL,
+};
 use crate::splat::ControlTexels;
 use crate::texture_set::{
     DEFAULT_PERCEPTUAL_ROUGHNESS, DEFAULT_TEXTURE_COLOUR, MAX_TEXTURES, TextureSet,
@@ -979,12 +984,48 @@ pub fn colour_map_image(map: Option<&ColourMap>) -> Image {
         1,
         TextureFormat::Rgba8UnormSrgb,
         data,
-        ImageSamplerDescriptor {
-            address_mode_u: ImageAddressMode::ClampToEdge,
-            address_mode_v: ImageAddressMode::ClampToEdge,
-            ..linear_anisotropic()
-        },
+        map_sampler(),
     )
+}
+
+/// The terrain's normal map as an uploadable image: `Rgba8Unorm` with a full mip
+/// chain, or one straight-up texel for a terrain with none.
+///
+/// Linear, because the bytes are directions and not colours. The chain averages
+/// each four texels as directions and renormalizes them, as the layer normal
+/// arrays' does, so a distant texel is the direction of the ground it stands for
+/// and not a shorter vector. Filtered, clamped to the edge and anisotropic: the
+/// shader reads it with the colour map's sampler, which is built from
+/// [`colour_map_image`]'s, and this one is the same so the two cannot disagree.
+///
+/// A map that fails [`ColourMap::validate`] builds the straight-up texel rather
+/// than reading past the texels it has.
+pub fn normal_map_image(map: Option<&ColourMap>) -> Image {
+    let (side, base) = match map.filter(|map| map.validate().is_ok()) {
+        Some(map) => (map.side, map.texels.iter().flatten().copied().collect()),
+        None => (1, UP_NORMAL_TEXEL.to_vec()),
+    };
+    let mut data = Vec::with_capacity(chain_texels(side, side) * 4);
+    push_mip_chain(&mut data, base, side, side, MipFilter::Normal);
+    mip_chained_image(
+        side,
+        side,
+        1,
+        TextureFormat::Rgba8Unorm,
+        data,
+        map_sampler(),
+    )
+}
+
+/// How the colour map and the normal map are filtered: linearly, anisotropic
+/// and clamped at the edge, so nothing wraps from one side of the terrain to the
+/// other.
+fn map_sampler() -> ImageSamplerDescriptor {
+    ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::ClampToEdge,
+        address_mode_v: ImageAddressMode::ClampToEdge,
+        ..linear_anisotropic()
+    }
 }
 
 /// UV0 remapped onto the colour map's texel centres.
@@ -1000,14 +1041,15 @@ pub fn colour_map_uv(uv: Vec2, side: u32) -> Vec2 {
     (uv * (side - 1.0) + Vec2::splat(0.5)) / side
 }
 
-/// A terrain's colour map as the material binds it: the uploaded image, and
-/// what the shader needs to sample it.
+/// A terrain's colour map, or its normal map, as the material binds it: the
+/// uploaded image, and what the shader needs to sample it.
 #[derive(Clone, Debug)]
 pub struct ColourMapBinding {
-    /// [`colour_map_image`] of the map, once it is in `Assets<Image>`.
+    /// [`colour_map_image`] of the map, or [`normal_map_image`] of a normal map,
+    /// once it is in `Assets<Image>`.
     pub image: Handle<Image>,
-    /// Texels per grid cell, or 0 where the terrain has no colour map and the
-    /// image is a single white texel.
+    /// Texels per grid cell, or 0 where the terrain has no such map and the
+    /// image is a single white (colour map) or straight-up (normal map) texel.
     pub scale: u32,
     /// Texels along one edge of the image.
     pub side: u32,
@@ -1024,11 +1066,23 @@ impl ColourMapBinding {
             side: map.map_or(1, |map| map.side),
         }
     }
+
+    /// [`Self::upload`] for the terrain's normal map: the image is
+    /// [`normal_map_image`], and a terrain with none binds one straight-up
+    /// texel. A map that fails [`ColourMap::validate`] is bound as none.
+    pub fn upload_normals(map: Option<&ColourMap>, images: &mut Assets<Image>) -> Self {
+        let map = map.filter(|map| map.validate().is_ok());
+        Self {
+            image: images.add(normal_map_image(map)),
+            scale: map.map_or(0, |map| u32::from(map.scale)),
+            side: map.map_or(1, |map| map.side),
+        }
+    }
 }
 
 impl Default for ColourMapBinding {
-    /// No colour map, and no image yet: what a material starts with before it
-    /// is pointed at one.
+    /// No map, and no image yet: what a material starts with before it is
+    /// pointed at one.
     fn default() -> Self {
         Self {
             image: Handle::default(),
@@ -1108,6 +1162,9 @@ pub struct TerrainSplatKey {
     /// The terrain has a colour map: the shader samples it and mixes it with
     /// each texture's own colour (`TERRAIN_COLOUR_MAP`).
     pub colour_map: bool,
+    /// The terrain has a normal map: the shader lights the surface from it in
+    /// place of the mesh's normal (`TERRAIN_NORMAL_MAP`).
+    pub normal_map: bool,
 }
 
 impl TerrainSplatKey {
@@ -1131,6 +1188,9 @@ impl TerrainSplatKey {
         if self.colour_map {
             defs.push("TERRAIN_COLOUR_MAP");
         }
+        if self.normal_map {
+            defs.push("TERRAIN_NORMAL_MAP");
+        }
         defs
     }
 }
@@ -1141,6 +1201,7 @@ impl From<&TerrainSplatMaterial> for TerrainSplatKey {
             relief: material.relief_depth > 0.0,
             grain: material.grain > 0.0,
             colour_map: material.colour_map_scale > 0,
+            normal_map: material.normal_map_scale > 0,
         }
     }
 }
@@ -1151,8 +1212,9 @@ impl From<&TerrainSplatMaterial> for TerrainSplatKey {
 /// than per chunk, so every chunk of a terrain shares one material and one
 /// upload.
 ///
-/// The pipeline is specialized on a [`TerrainSplatKey`]: relief, grain and the
-/// colour map are compiled into the shader only for a material that uses them.
+/// The pipeline is specialized on a [`TerrainSplatKey`]: relief, grain, the
+/// colour map and the normal map are compiled into the shader only for a
+/// material that uses them.
 #[derive(Asset, AsBindGroup, TypePath, Clone, Debug)]
 #[bind_group_data(TerrainSplatKey)]
 pub struct TerrainSplatMaterial {
@@ -1253,6 +1315,12 @@ pub struct TerrainSplatMaterial {
     /// Texels along one edge of the colour map.
     #[uniform(0)]
     pub colour_map_side: u32,
+    /// Texels per grid cell of the normal map, or 0 where the terrain has none.
+    #[uniform(0)]
+    pub normal_map_scale: u32,
+    /// Texels along one edge of the normal map.
+    #[uniform(0)]
+    pub normal_map_side: u32,
     #[texture(1, dimension = "2d_array")]
     #[sampler(2)]
     pub albedo: Handle<Image>,
@@ -1283,6 +1351,12 @@ pub struct TerrainSplatMaterial {
     #[texture(11)]
     #[sampler(12)]
     pub colour_map: Handle<Image>,
+    /// The terrain's normal map, or one straight-up texel without one. It has no
+    /// sampler of its own: the shader reads it with the colour map's, which
+    /// filters and clamps the same way. Metal allows 16 samplers a stage, and
+    /// this material, with the view's, is close to using them.
+    #[texture(13)]
+    pub normal_map: Handle<Image>,
 }
 
 impl Material for TerrainSplatMaterial {
@@ -1374,6 +1448,9 @@ impl TerrainSplatMaterial {
             height_slots: slot_mask(set, |entry| entry.height.is_some()),
             colour_map_scale: colour_map.scale,
             colour_map_side: colour_map.side,
+            // No normal map until `set_normal_map` points the material at one.
+            normal_map_scale: 0,
+            normal_map_side: 1,
             albedo: arrays.albedo,
             normal: arrays.normal,
             height: arrays.height,
@@ -1383,6 +1460,7 @@ impl TerrainSplatMaterial {
             occlusion: arrays.occlusion,
             roughness: arrays.roughness,
             colour_map: colour_map.image,
+            normal_map: Handle::default(),
         };
         for (id, stats) in material.slot_stats.iter_mut().enumerate() {
             let measured = arrays.stats.get(id).copied().unwrap_or(SlotStats::NEUTRAL);
@@ -1417,6 +1495,19 @@ impl TerrainSplatMaterial {
         self.colour_map_scale = colour_map.scale;
         self.colour_map_side = colour_map.side;
         self.colour_map = colour_map.image;
+    }
+
+    /// Point the normal map half of the uniform and the binding at `normal_map`,
+    /// from [`ColourMapBinding::upload_normals`], as [`Self::set_colour_map`]
+    /// does for the colour map. A material starts with none, drawing from the
+    /// mesh's normals.
+    ///
+    /// Crossing from no map to one, or back, switches the pipeline's variant
+    /// ([`TerrainSplatKey::normal_map`]); a new map in place of one is a rebind.
+    pub fn set_normal_map(&mut self, normal_map: ColourMapBinding) {
+        self.normal_map_scale = normal_map.scale;
+        self.normal_map_side = normal_map.side;
+        self.normal_map = normal_map.image;
     }
 
     /// Point the autoterrain half of the uniform at `settings`.
@@ -1769,6 +1860,7 @@ mod resolve_tests {
 mod tests {
     use super::*;
     use crate::control::Control;
+    use crate::sidecar::normal_texel;
     use crate::texture_set::TextureSetEntry;
 
     fn solid(width: u32, height: u32, texel: [u8; 4], format: TextureFormat) -> Image {
@@ -2751,6 +2843,7 @@ mod tests {
             (10, "var roughness_array: texture_2d_array<f32>"),
             (11, "var colour_map: texture_2d<f32>"),
             (12, "var colour_map_sampler: sampler"),
+            (13, "var normal_map: texture_2d<f32>"),
         ] {
             let expected =
                 format!("@group(#{{MATERIAL_BIND_GROUP}}) @binding({binding}) {declaration};");
@@ -2801,6 +2894,8 @@ mod tests {
             "height_slots: u32",
             "colour_map_scale: u32",
             "colour_map_side: u32",
+            "normal_map_scale: u32",
+            "normal_map_side: u32",
         ] {
             let found = body[at..]
                 .find(field)
@@ -3200,13 +3295,14 @@ mod tests {
 
     /// With nothing said the dials are what existing terrains render at.
     #[test]
-    fn a_default_material_has_the_default_bands_and_no_colour_map() {
+    fn a_default_material_has_the_default_bands_and_no_colour_map_or_normal_map() {
         let material = material_over(&TextureSet::default(), &[]);
         assert_eq!(material.near_distance, 30.0);
         assert_eq!(material.far_distance, 150.0);
         assert_eq!(material.relief_depth, 0.0);
         assert_eq!(material.grain, 0.0);
         assert_eq!(material.colour_map_scale, 0);
+        assert_eq!(material.normal_map_scale, 0);
         assert_eq!(material.height_slots, 0);
         assert!(material.slot_stats.iter().all(|stats| stats.x == 1.0));
     }
@@ -3343,6 +3439,123 @@ mod tests {
         assert_eq!(material.colour_map, binding.image);
     }
 
+    /// The normal map goes up linear, with a full mip chain, built the way the
+    /// colour map is, because the shader reads it with the colour map's sampler.
+    #[test]
+    fn the_normal_map_image_is_linear_with_a_full_mip_chain_and_the_colour_maps_sampler() {
+        let texels: Vec<[u8; 4]> = (0..25u8)
+            .map(|i| {
+                normal_texel(Vec3::new(
+                    f32::from(i % 5) - 2.0,
+                    4.0,
+                    f32::from(i / 5) - 2.0,
+                ))
+            })
+            .collect();
+        let map = ColourMap::new(3, 2, texels.clone()).expect("5 by 5");
+
+        let image = normal_map_image(Some(&map));
+
+        assert_eq!(
+            image.texture_descriptor.format,
+            TextureFormat::Rgba8Unorm,
+            "linear: the bytes are directions and not colours"
+        );
+        assert_eq!(image.texture_descriptor.size.width, 5);
+        assert_eq!(image.texture_descriptor.size.depth_or_array_layers, 1);
+        assert_eq!(
+            image.texture_descriptor.mip_level_count, 3,
+            "5, 2 and 1 texels"
+        );
+        let data = image.data.as_ref().expect("built images carry data");
+        assert_eq!(data.len(), (25 + 4 + 1) * 4);
+        assert_eq!(&data[..4], &texels[0]);
+        assert_eq!(&data[24 * 4..25 * 4], &texels[24]);
+        assert!(
+            image.texture_view_descriptor.is_none(),
+            "a plain 2D texture, not an array"
+        );
+        assert_eq!(
+            sampler_of(&image),
+            sampler_of(&colour_map_image(Some(&map))),
+            "the shader reads the one with the other's sampler"
+        );
+    }
+
+    /// A mip stands for the ground under it, so it averages directions and stays
+    /// a unit normal. A fold leaning each way is level ground at the one-texel
+    /// mip, and as long a normal as any: averaged as plain bytes it would be
+    /// level but shorter, which lights darker the farther the terrain is.
+    #[test]
+    fn the_normal_map_mips_average_as_directions_and_stay_unit_length() {
+        let lean = |x: f32| normal_texel(Vec3::new(x, 0.8, 0.0));
+        let map = ColourMap::new(2, 1, vec![lean(0.6), lean(-0.6), lean(0.6), lean(-0.6)])
+            .expect("2 by 2");
+
+        let image = normal_map_image(Some(&map));
+
+        let data = image.data.as_ref().expect("built images carry data");
+        let one_texel = &data[16..20];
+        for (got, want) in one_texel.iter().zip(UP_NORMAL_TEXEL) {
+            assert!(got.abs_diff(want) <= 1, "{one_texel:?} against straight up");
+        }
+    }
+
+    /// No normal map is one straight-up texel, and so is one the format could not
+    /// have stored.
+    #[test]
+    fn no_normal_map_binds_a_single_straight_up_texel() {
+        let mut images = Assets::<Image>::default();
+        let none = ColourMapBinding::upload_normals(None, &mut images);
+        assert_eq!((none.scale, none.side), (0, 1));
+        let image = images.get(&none.image).expect("uploaded");
+        assert_eq!(image.texture_descriptor.size.width, 1);
+        assert_eq!(image.data.as_deref(), Some(&UP_NORMAL_TEXEL[..]));
+
+        let unfit = ColourMap {
+            scale: 9,
+            side: 2,
+            texels: vec![[1; 4]; 4],
+        };
+        let refused = ColourMapBinding::upload_normals(Some(&unfit), &mut images);
+        assert_eq!(
+            (refused.scale, refused.side),
+            (0, 1),
+            "a map the format cannot hold is bound as none"
+        );
+    }
+
+    #[test]
+    fn a_normal_map_binding_describes_the_map_it_uploaded_and_reaches_the_material() {
+        let mut images = Assets::<Image>::default();
+        let map = ColourMap::new(3, 4, vec![UP_NORMAL_TEXEL; 81]).expect("9 by 9");
+
+        let binding = ColourMapBinding::upload_normals(Some(&map), &mut images);
+
+        assert_eq!((binding.scale, binding.side), (4, 9));
+        assert_eq!(
+            images
+                .get(&binding.image)
+                .expect("uploaded")
+                .texture_descriptor
+                .size
+                .width,
+            9
+        );
+        let mut material = material_over(&TextureSet::default(), &[]);
+        let colour_map = material.colour_map.clone();
+        material.set_normal_map(binding.clone());
+        assert_eq!(material.normal_map_scale, 4);
+        assert_eq!(material.normal_map_side, 9);
+        assert_eq!(material.normal_map, binding.image);
+        assert_eq!(
+            (material.colour_map_scale, material.colour_map_side),
+            (0, 1),
+            "the colour map is its own"
+        );
+        assert_eq!(material.colour_map, colour_map);
+    }
+
     /// At a scale of 1 the colour map is laid out like the tint, texel for grid
     /// point, so the two mappings must agree exactly. At higher scales texel
     /// `scale * i` is centred on grid point `i`.
@@ -3375,6 +3588,44 @@ mod tests {
             SHADER_SOURCE.contains("(in.uv * (colour_res - 1.0) + 0.5) / colour_res"),
             "the fragment must sample the colour map at texel centres, as `colour_map_uv` does"
         );
+    }
+
+    /// The normal map is laid out like the colour map, so it is read at the same
+    /// texel centres, and with the colour map's sampler: the material has none to
+    /// spare. It is read in uniform control flow, ahead of the frame built from
+    /// the normal it gives, while the shadows are still biased along the mesh's.
+    #[test]
+    fn the_normal_map_is_read_at_texel_centres_with_the_colour_maps_sampler() {
+        let read = shader_function("baked_normal");
+        assert!(
+            read.contains("(uv * (side - 1.0) + 0.5) / side"),
+            "the normal map must be sampled at texel centres, as `colour_map_uv` does"
+        );
+        assert!(read.contains("textureSample(normal_map, colour_map_sampler, texel_uv)"));
+        assert!(
+            read.contains("vec3<f32>(stored.x, stored.z, stored.y)"),
+            "a texel is (x, z, y)"
+        );
+        assert!(read.contains("normalize(normal_to_world * local)"));
+        assert!(
+            !SHADER_SOURCE.contains("normal_map_sampler"),
+            "no sampler of its own"
+        );
+
+        let body = shader_function("fragment");
+        let normal = body
+            .find("baked_normal(in.uv, normal_to_world, geometric)")
+            .expect("the fragment reads the normal map");
+        assert!(body.contains("splat.normal_map_scale > 0u"));
+        assert!(
+            normal
+                < body
+                    .find("let tbn = mat3x3<f32>(t, b, n);")
+                    .expect("the frame is built from the normal"),
+            "the frame is built from the normal map's normal"
+        );
+        assert!(body.contains("pbr_input.world_normal = geometric;"));
+        assert!(body.contains("pbr_input.N = mapped_normal;"));
     }
 
     /// The body of a function in the shader, from its signature to the next
@@ -3465,6 +3716,7 @@ mod tests {
             "dpdy(local)",
             "textureSample(tint_map",
             "textureSample(colour_map",
+            "baked_normal(",
         ] {
             let at = body
                 .find(call)
@@ -3659,12 +3911,16 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
 }
 "#;
 
-    /// The key a combination of the three flags is, by the bits of `bits`.
+    /// Every combination of the key's four flags.
+    const KEYS: u8 = 16;
+
+    /// The key a combination of the four flags is, by the bits of `bits`.
     fn key_of(bits: u8) -> TerrainSplatKey {
         TerrainSplatKey {
             relief: bits & 1 != 0,
             grain: bits & 2 != 0,
             colour_map: bits & 4 != 0,
+            normal_map: bits & 8 != 0,
         }
     }
 
@@ -3679,8 +3935,9 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
     /// validates what it composes only with debug assertions on.
     ///
     /// The composed module is measured too, which is what shows that a variant
-    /// without a part really compiles none of it: its relief functions are
-    /// absent, and every part a variant adds makes the module bigger.
+    /// without a part really compiles none of it: its relief functions and its
+    /// normal map read are absent, and every part a variant adds makes the
+    /// module bigger.
     #[cfg(debug_assertions)]
     #[test]
     fn the_splat_shader_composes_and_validates_in_every_variant_against_stubs_of_bevys_pieces() {
@@ -3748,8 +4005,8 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
         let mut cache = ShaderCache::new((), WgpuFeatures::empty(), DownlevelFlags::all(), measure);
         cache.set_shader(handle.id(), shader);
 
-        let mut sizes = [0usize; 8];
-        for bits in 0..8u8 {
+        let mut sizes = [0usize; KEYS as usize];
+        for bits in 0..KEYS {
             let key = key_of(bits);
             let mut definitions = vec![ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 2)];
             definitions.extend(key.shader_defs().into_iter().map(ShaderDefVal::from));
@@ -3772,13 +4029,18 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
                     "{function} for {key:?}"
                 );
             }
+            assert_eq!(
+                variant.functions.iter().any(|name| name == "baked_normal"),
+                key.normal_map,
+                "baked_normal for {key:?}"
+            );
             sizes[usize::from(bits)] = variant.size;
         }
 
         // Every part a variant adds is code it compiles, and none a variant
         // lacks is: a superset of the parts is always the bigger module.
-        for fewer in 0..8usize {
-            for more in 0..8usize {
+        for fewer in 0..usize::from(KEYS) {
+            for more in 0..usize::from(KEYS) {
                 if fewer != more && fewer & more == fewer {
                     assert!(
                         sizes[more] > sizes[fewer],
@@ -3795,8 +4057,8 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
 
     /// A terrain that uses none of the optional parts keys the plain pipeline,
     /// and the key follows the dials that switch code and none of the others:
-    /// the relief depth, the grain and the colour map, and not the bands, the
-    /// blend or the tint.
+    /// the relief depth, the grain, the colour map and the normal map, and not
+    /// the bands, the blend or the tint.
     #[test]
     fn the_pipeline_key_follows_the_dials_that_switch_shader_code() {
         let mut material = material_over(&TextureSet::default(), &[]);
@@ -3840,8 +4102,42 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
                 ..plain
             }
         );
+        // The normal map is a part of its own: it switches on with its map, and
+        // leaves the colour map and the dials as they were.
+        material.set_normal_map(ColourMapBinding {
+            image: Handle::default(),
+            scale: 4,
+            side: 17,
+        });
+        assert_eq!(
+            TerrainSplatKey::from(&material),
+            TerrainSplatKey {
+                grain: true,
+                colour_map: true,
+                normal_map: true,
+                ..plain
+            }
+        );
+        assert_eq!(
+            TerrainSplatKey::from(&material).shader_defs(),
+            [
+                "TERRAIN_GRAIN",
+                "TERRAIN_DOMINANT",
+                "TERRAIN_COLOUR_MAP",
+                "TERRAIN_NORMAL_MAP"
+            ]
+        );
         material.set_colour_map(ColourMapBinding::default());
         material.set_surface(SurfaceSettings::default());
+        assert_eq!(
+            TerrainSplatKey::from(&material),
+            TerrainSplatKey {
+                normal_map: true,
+                ..plain
+            },
+            "the normal map outlives the rest"
+        );
+        material.set_normal_map(ColourMapBinding::default());
         assert_eq!(TerrainSplatKey::from(&material), plain, "all of it undone");
 
         // What changes a look without changing code leaves the pipeline alone.
@@ -3870,7 +4166,7 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
     /// the part out for good, or leave it in for everyone.
     #[test]
     fn the_defs_the_key_sets_are_the_defs_the_shader_wraps() {
-        let mut set: Vec<&str> = (0..8u8)
+        let mut set: Vec<&str> = (0..KEYS)
             .flat_map(|bits| key_of(bits).shader_defs())
             .collect();
         set.sort_unstable();
@@ -3881,6 +4177,7 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
                 "TERRAIN_COLOUR_MAP",
                 "TERRAIN_DOMINANT",
                 "TERRAIN_GRAIN",
+                "TERRAIN_NORMAL_MAP",
                 "TERRAIN_RELIEF"
             ]
         );
@@ -3896,7 +4193,7 @@ fn main_pass_post_lighting_processing(input: PbrInput, color: vec4<f32>) -> vec4
 
         // Either part that needs the dominant texture turns the choice of it
         // on, and nothing else does.
-        for bits in 0..8u8 {
+        for bits in 0..KEYS {
             let key = key_of(bits);
             assert_eq!(
                 key.shader_defs().contains(&"TERRAIN_DOMINANT"),

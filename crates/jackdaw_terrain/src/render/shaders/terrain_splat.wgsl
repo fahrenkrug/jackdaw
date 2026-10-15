@@ -39,7 +39,7 @@
 // march is the only loop, and it runs only in the near band, on slots that have
 // a height map of their own, when the relief depth is set.
 //
-// Three optional parts are compiled only for a material that uses them, so a
+// Four optional parts are compiled only for a material that uses them, so a
 // terrain that has none of them pays for none of them. `TerrainSplatKey` in
 // render/mod.rs keys the pipeline on what the material has and sets the defs:
 //
@@ -47,6 +47,8 @@
 //   TERRAIN_GRAIN       grain above 0: the grain read
 //   TERRAIN_COLOUR_MAP  a colour map: its sample, and the mix of it with the
 //                       texture's own colour
+//   TERRAIN_NORMAL_MAP  a normal map: the surface is lit from it per pixel
+//                       rather than from the mesh's normal
 //   TERRAIN_DOMINANT    either of the first two: the choice of the texture they
 //                       are made from
 //
@@ -193,6 +195,10 @@ struct SplatUniform {
     colour_map_scale: u32,
     // Texels along one edge of the colour map.
     colour_map_side: u32,
+    // Texels per grid cell of the normal map, 0 where the terrain has none.
+    normal_map_scale: u32,
+    // Texels along one edge of the normal map.
+    normal_map_side: u32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> splat: SplatUniform;
@@ -208,6 +214,10 @@ struct SplatUniform {
 @group(#{MATERIAL_BIND_GROUP}) @binding(10) var roughness_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(11) var colour_map: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(12) var colour_map_sampler: sampler;
+// The normal map has no sampler of its own: it is read with `colour_map_sampler`,
+// which filters and clamps the same way. Metal allows 16 samplers a stage and
+// the splat material, with the view's, is close to using them.
+@group(#{MATERIAL_BIND_GROUP}) @binding(13) var normal_map: texture_2d<f32>;
 
 // Everything about the fragment that every texture id's accumulation shares,
 // worked out once at the top of `fragment`.
@@ -767,6 +777,46 @@ fn relief_travel(
 }
 #endif
 
+#ifdef TERRAIN_NORMAL_MAP
+// A normal read back shorter than this points nowhere: texels leaning opposite
+// ways, filtered to the middle of a fold.
+const NORMAL_MAP_MIN_LENGTH_SQ: f32 = 1e-4;
+
+// The terrain's own normal under a fragment, in world space, read from the baked
+// normal map. `geometric` is the mesh's normal, which stands in where the map
+// says nothing.
+//
+// The map is laid out like the colour map, over its own finer grid: texel
+// `scale * i` sits on grid point `i`. UV0 puts grid point `i` at `i / (res - 1)`
+// while a sampled texel `j` is centred at `(j + 0.5) / side`, so the coordinate
+// is remapped onto texel centres. `render::colour_map_uv` spells the same
+// mapping in Rust. The map is read with the colour map's sampler.
+//
+// A texel stores the terrain-space unit normal as (x, z, y), in linear bytes: a
+// tangent-space normal of the flat terrain, U along X and V along Z, so the
+// texel is turned into terrain axes by a swizzle and into world axes by the
+// transform that moves normals, whatever the terrain's own rotation and scale.
+// The mips were renormalized when the map was uploaded, so a filtered texel is
+// close to unit length and the normalize below only removes what 8 bits and the
+// filter leave.
+//
+// Called from uniform control flow, for the derivatives the sample takes.
+fn baked_normal(
+    uv: vec2<f32>,
+    normal_to_world: mat3x3<f32>,
+    geometric: vec3<f32>,
+) -> vec3<f32> {
+    let side = f32(max(splat.normal_map_side, 2u));
+    let texel_uv = (uv * (side - 1.0) + 0.5) / side;
+    let stored = textureSample(normal_map, colour_map_sampler, texel_uv).rgb * 2.0 - 1.0;
+    let local = vec3<f32>(stored.x, stored.z, stored.y);
+    if dot(local, local) < NORMAL_MAP_MIN_LENGTH_SQ {
+        return geometric;
+    }
+    return normalize(normal_to_world * local);
+}
+#endif
+
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     // UV0 is 0..1 across the whole terrain, shared bit for bit by chunks
@@ -829,15 +879,36 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
 #endif
 
+    // The surface the mesh draws. Shadows are biased against it whatever the
+    // normal map says (`pbr_input.world_normal` below).
+    let world_normal = pbr_functions::prepare_world_normal(in.world_normal, false, is_front);
+    let geometric = normalize(world_normal);
+    // A normal goes to world space with the inverse transpose of the transform
+    // that moves positions: `local_from_world` transposed.
+    let normal_to_world = transpose(mat3x3<f32>(
+        local_from_world[0].xyz, local_from_world[1].xyz, local_from_world[2].xyz));
+
     // The surface's normal, and the frame the top plane's normals are read in.
-    //
+    // A terrain baked with a normal map takes it from there, per pixel, finer
+    // than the mesh it is drawn on: the fine creases the mesh averages away, and
+    // the same normal on both sides of the edge between two detail levels. The
+    // choice is on a uniform, so the sample stays in uniform control flow. Every
+    // use of `n` below, the planes' shares, the cliffs' whiteout, the far band
+    // and the relief included, is of this normal.
+#ifdef TERRAIN_NORMAL_MAP
+    let n = select(
+        geometric,
+        baked_normal(in.uv, normal_to_world, geometric),
+        splat.normal_map_scale > 0u,
+    );
+#else
+    let n = geometric;
+#endif
     // The mesher emits no tangents: UV0 runs along world X and Z, so the tangent
     // is world +X projected onto the surface normal. That projection collapses
     // where the surface stands vertical and faces X, so +Z stands in there.
     // Picking the axis the normal leans on least would swap the frame by 90
     // degrees wherever |n.x| and |n.z| cross, seaming flat ground.
-    let world_normal = pbr_functions::prepare_world_normal(in.world_normal, false, is_front);
-    let n = normalize(world_normal);
     var reference = vec3<f32>(1.0, 0.0, 0.0);
     if abs(n.x) > 0.999 {
         reference = vec3<f32>(0.0, 0.0, 1.0);
@@ -847,16 +918,14 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let tbn = mat3x3<f32>(t, b, n);
 
     // How the three projections share this fragment. The ground's own up is the
-    // terrain's Y, so the normal is taken into terrain space first. A normal
-    // goes with the inverse transpose of the transform that moves positions:
-    // `world_from_local` transposed one way, `local_from_world` the other.
+    // terrain's Y, so the normal is taken into terrain space first: with
+    // `world_from_local` transposed, where `normal_to_world` above is
+    // `local_from_world` transposed.
     let world_from_local = get_world_from_local(in.instance_index);
     let to_local = transpose(mat3x3<f32>(
         world_from_local[0].xyz, world_from_local[1].xyz, world_from_local[2].xyz));
     let local_normal = normalize(to_local * n);
     frame.local_normal = local_normal;
-    let normal_to_world = transpose(mat3x3<f32>(
-        local_from_world[0].xyz, local_from_world[1].xyz, local_from_world[2].xyz));
     let steep = smoothstep(STEEP_START, STEEP_END, 1.0 - local_normal.y);
     frame.planes = vec3<f32>(1.0, 0.0, 0.0);
     if steep > 0.0 {
@@ -1174,7 +1243,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     pbr_input.material.flags |= pbr_types::STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT;
     pbr_input.frag_coord = in.position;
     pbr_input.world_position = in.world_position;
-    pbr_input.world_normal = n;
+    // The shadows are biased along the surface the mesh draws, so a crease in a
+    // normal map cannot pull the bias off the real surface; the lighting reads
+    // the shading normal, `N`.
+    pbr_input.world_normal = geometric;
     pbr_input.N = mapped_normal;
     pbr_input.is_orthographic = is_ortho;
     pbr_input.V = pbr_functions::calculate_view(in.world_position, pbr_input.is_orthographic);
