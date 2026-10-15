@@ -219,9 +219,41 @@
 //! 1, the near distance at 30 metres, the far distance at 150, no relief, no
 //! grain and no colour map.
 //!
+//! # Format version 13
+//!
+//! Version 12 with a normal map block behind the colour map block, ahead of the
+//! scatter palette, laid out exactly as the colour map block is:
+//!
+//! ```text
+//! offset  size          field
+//!         1             scale, u8 (0 = no normal map; 1..=4 texels per
+//!                        grid cell)
+//!         3             padding, must be 0
+//!         4             side, u32 (texels per edge, at most 4096; 0
+//!                        where there is no map)
+//! then, only where scale is not 0:
+//!         4*side^2      normal map, RGBA8 linear, row-major
+//! ```
+//!
+//! Texel `scale * i` lies on grid point `i`, as in the colour map. A texel holds
+//! the terrain-space unit normal stored as `(x, z, y)`: each component `v`
+//! becomes `(v * 0.5 + 0.5) * 255`, rounded, and alpha is 255. That is a
+//! tangent-space normal of the flat terrain, with `x` along U and `z` along V,
+//! so straight up is `[128, 128, 255, 255]`. The bytes are linear numbers, not
+//! an sRGB colour; [`normal_texel`] writes one.
+//!
+//! A terrain with a normal map is lit per pixel from it rather than from the
+//! mesh, so the map can be finer than the grid and carry detail the mesh has
+//! no vertex for.
+//!
+//! The writer emits version 13 only for a document that has a normal map. A
+//! document without one is written as version 12, byte for byte as it always
+//! was, so an older build reads it. A version-12 or older file reads back with
+//! no normal map.
+//!
 //! [`load`] and [`save`] are the entry points: `load` upgrades older files
-//! forward and `save` always writes the current version, refusing anything
-//! newer than this build. The bare `encode`/`decode` and
+//! forward and `save` writes the oldest version that can hold the document,
+//! refusing anything newer than this build. The bare `encode`/`decode` and
 //! `encode_regions`/`decode_regions` pairs address one format directly.
 
 use std::collections::{BTreeMap, HashSet};
@@ -294,8 +326,15 @@ pub const VERSION_11: u16 = 11;
 /// Material slots that may give up their own texture colour to a colour map,
 /// a surface block with the near and far bands, the relief depth and the
 /// grain, and an optional colour map after it. A version-11 or older file
-/// loads with every one at its default. What [`save`] writes.
+/// loads with every one at its default. What [`save`] writes for a document
+/// with no normal map.
 pub const VERSION_12: u16 = 12;
+
+/// Region documents with an optional normal map after the colour map, for a
+/// terrain lit per pixel from a normal baked finer than its grid. A version-12
+/// or older file loads without one. What [`save`] writes for a document that
+/// has a normal map, and only for one.
+pub const VERSION_13: u16 = 13;
 
 const SLOT_FLAG_ROUGHNESS: u8 = 1 << 0;
 const SLOT_FLAG_REFLECTANCE: u8 = 1 << 1;
@@ -647,7 +686,8 @@ const SURFACE_BLOCK_LEN_V6: usize = 8;
 /// near distance, the far distance, the relief depth and the grain.
 const SURFACE_BLOCK_LEN: usize = 24;
 /// Bytes the version-12 colour map block occupies ahead of any texels: the
-/// scale, three bytes of padding and the side.
+/// scale, three bytes of padding and the side. The version-13 normal map block
+/// has the same header.
 const COLOUR_MAP_HEADER_LEN: usize = 8;
 /// Bytes one version-7 placement record occupies: two indices and five
 /// floats.
@@ -804,7 +844,8 @@ pub fn side_for(control_resolution: u32, scale: u8) -> u32 {
         .saturating_add(1)
 }
 
-/// Why a [`ColourMap`] cannot be stored.
+/// Why a [`ColourMap`] cannot be stored, whether it is the terrain's colour map
+/// or its normal map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColourMapError {
     /// A scale outside `1..=`[`MAX_COLOUR_MAP_SCALE`].
@@ -823,17 +864,15 @@ pub enum ColourMapError {
 impl core::fmt::Display for ColourMapError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::BadScale(scale) => write!(
-                f,
-                "colour map scale {scale} is outside 1..={MAX_COLOUR_MAP_SCALE}"
-            ),
-            Self::BadSide(side) => write!(
-                f,
-                "colour map side {side} is outside 1..={MAX_COLOUR_MAP_SIDE}"
-            ),
+            Self::BadScale(scale) => {
+                write!(f, "map scale {scale} is outside 1..={MAX_COLOUR_MAP_SCALE}")
+            }
+            Self::BadSide(side) => {
+                write!(f, "map side {side} is outside 1..={MAX_COLOUR_MAP_SIDE}")
+            }
             Self::WrongTexelCount { expected, found } => write!(
                 f,
-                "colour map holds {found} texels where its side calls for {expected}"
+                "map holds {found} texels where its side calls for {expected}"
             ),
         }
     }
@@ -852,6 +891,10 @@ impl core::error::Error for ColourMapError {}
 ///
 /// Edits to the regions and the paint never touch it, and an edit that moves
 /// the grid leaves it where it was baked.
+///
+/// The same struct carries the terrain's normal map
+/// ([`RegionTerrainData::normal_map`]), whose texels are linear normals rather
+/// than sRGB colours: see [`normal_texel`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColourMap {
     /// Texels per grid cell along each edge, `1..=`[`MAX_COLOUR_MAP_SCALE`].
@@ -859,8 +902,25 @@ pub struct ColourMap {
     /// Texels per edge: [`side_for`] the terrain's control resolution and
     /// `scale`. At most [`MAX_COLOUR_MAP_SIDE`].
     pub side: u32,
-    /// RGBA8, sRGB-encoded, row-major, `side * side` texels.
+    /// RGBA8, row-major, `side * side` texels. sRGB-encoded for a colour map,
+    /// linear for a normal map.
     pub texels: Vec<[u8; 4]>,
+}
+
+/// The texel of a normal map that points straight up: the flat terrain.
+pub const UP_NORMAL_TEXEL: [u8; 4] = [128, 128, 255, 255];
+
+/// The normal-map texel for a terrain-space normal, in the order the format
+/// stores it: `(x, z, y)`, each component `v` as `(v * 0.5 + 0.5) * 255`
+/// rounded, alpha 255.
+///
+/// `normal` need not be unit length; it is normalized first. One that is not
+/// finite or has no length is straight up.
+#[must_use]
+pub fn normal_texel(normal: bevy_math::Vec3) -> [u8; 4] {
+    let unit = normal.try_normalize().unwrap_or(bevy_math::Vec3::Y);
+    let byte = |v: f32| ((v * 0.5 + 0.5) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+    [byte(unit.x), byte(unit.z), byte(unit.y), 255]
 }
 
 impl ColourMap {
@@ -1029,6 +1089,9 @@ pub enum SidecarError {
     /// A colour map declared a scale or side the format cannot store, or
     /// holds a different number of texels than its side calls for.
     InvalidColourMap(ColourMapError),
+    /// A normal map declared a scale or side the format cannot store, or
+    /// holds a different number of texels than its side calls for.
+    InvalidNormalMap(ColourMapError),
 }
 
 impl core::fmt::Display for SidecarError {
@@ -1071,6 +1134,9 @@ impl core::fmt::Display for SidecarError {
             ),
             Self::InvalidColourMap(reason) => {
                 write!(f, "terrain sidecar colour map is invalid: {reason}")
+            }
+            Self::InvalidNormalMap(reason) => {
+                write!(f, "terrain sidecar normal map is invalid: {reason}")
             }
         }
     }
@@ -1415,6 +1481,20 @@ pub struct RegionTerrainData {
     /// Edits to the regions and the paint never touch it; whoever rebuilds a
     /// document from another carries it across.
     pub colour_map: Option<ColourMap>,
+    /// The baked normal of the whole terrain, or `None` to light it from the
+    /// mesh. `None` on every file older than [`VERSION_13`].
+    ///
+    /// A terrain with one is lit per pixel from it: it can be finer than the
+    /// grid, built from a finer heightfield than the mesh has, so creases the
+    /// mesh averages away and the edges between detail levels light evenly. The
+    /// texels are linear, each the terrain-space unit normal stored as
+    /// `(x, z, y)`, so straight up is [`UP_NORMAL_TEXEL`]; [`normal_texel`]
+    /// writes one. Texel `scale * i` lies on grid point `i`, as in the colour
+    /// map, so [`ColourMap::new`] with the terrain's grid resolution works the
+    /// side out.
+    ///
+    /// Carried across edits like [`Self::colour_map`].
+    pub normal_map: Option<ColourMap>,
     /// Where this document's cells sit in the world, or `None` when the file it
     /// came from is too old to state it.
     ///
@@ -1438,6 +1518,7 @@ impl Default for RegionTerrainData {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         }
@@ -1557,6 +1638,7 @@ impl RegionTerrainData {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             // Version 1 states no geometry, so its cells are placed by the
             // component's rectangle.
             grid: None,
@@ -1856,6 +1938,12 @@ impl RegionTerrainData {
         if let Some(map) = &self.colour_map {
             len = len.checked_add(map.texels.len().checked_mul(4)?)?;
         }
+        // The normal map block is written only with a normal map, in a
+        // version-13 file.
+        if let Some(map) = &self.normal_map {
+            len = len.checked_add(COLOUR_MAP_HEADER_LEN)?;
+            len = len.checked_add(map.texels.len().checked_mul(4)?)?;
+        }
 
         // Scatter palette block: two count-prefixed tables. Tombstoned
         // rows are not written, so they are not measured either.
@@ -1880,6 +1968,68 @@ impl RegionTerrainData {
         }
         Some(len)
     }
+}
+
+/// One map block, as the colour map and the normal map are both written: the
+/// scale, three bytes of padding and the side, then the texels where there is a
+/// map. No map writes a zero scale and a zero side and nothing after.
+fn encode_map_block(out: &mut Vec<u8>, map: Option<&ColourMap>) {
+    match map {
+        Some(map) => {
+            out.push(map.scale);
+            out.extend_from_slice(&[0u8; 3]);
+            out.extend_from_slice(&map.side.to_le_bytes());
+            for texel in &map.texels {
+                out.extend_from_slice(texel);
+            }
+        }
+        None => {
+            out.push(0);
+            out.extend_from_slice(&[0u8; 3]);
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
+}
+
+/// Read one map block [`encode_map_block`] wrote. `invalid` says which map a
+/// scale or side the format cannot hold belongs to.
+fn decode_map_block(
+    r: &mut Reader<'_>,
+    invalid: fn(ColourMapError) -> SidecarError,
+) -> Result<Option<ColourMap>, SidecarError> {
+    let scale = r.u8()?;
+    if r.take(3)? != [0u8; 3] {
+        return Err(SidecarError::ReservedFieldSet);
+    }
+    let side = r.u32()?;
+    if scale == 0 {
+        // No map states no side; one that does means more than this build
+        // understands.
+        if side != 0 {
+            return Err(SidecarError::ReservedFieldSet);
+        }
+        return Ok(None);
+    }
+    // Checked before any texel is read, so a file claiming a huge map cannot
+    // make this reserve it.
+    if scale > MAX_COLOUR_MAP_SCALE {
+        return Err(invalid(ColourMapError::BadScale(scale)));
+    }
+    if side == 0 || side > MAX_COLOUR_MAP_SIDE {
+        return Err(invalid(ColourMapError::BadSide(side)));
+    }
+    let texels = (side as usize)
+        .checked_mul(side as usize)
+        .ok_or(SidecarError::TooLarge)?;
+    let texel_bytes = r.take(texels.checked_mul(4).ok_or(SidecarError::TooLarge)?)?;
+    Ok(Some(ColourMap {
+        scale,
+        side,
+        texels: texel_bytes
+            .chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect(),
+    }))
 }
 
 /// Where each row of a side table lands once the tombstones are dropped,
@@ -1919,6 +2069,9 @@ pub fn encode_regions(data: &RegionTerrainData) -> Result<Vec<u8>, SidecarError>
     if let Some(map) = &data.colour_map {
         map.validate().map_err(SidecarError::InvalidColourMap)?;
     }
+    if let Some(map) = &data.normal_map {
+        map.validate().map_err(SidecarError::InvalidNormalMap)?;
+    }
     // Tombstoned rows are dropped on the way out and the surviving ones
     // renumbered, so a document stamped and cleared many times does not carry a
     // row per run. A placement's index is remapped with them.
@@ -1946,8 +2099,16 @@ pub fn encode_regions(data: &RegionTerrainData) -> Result<Vec<u8>, SidecarError>
 
     let mut out = Vec::with_capacity(data.encoded_len().ok_or(SidecarError::TooLarge)?);
 
+    // Version 12 holds everything but a normal map and is what a document
+    // without one has always been written as, so those bytes do not change and
+    // a build that predates version 13 still reads them.
+    let version = if data.normal_map.is_some() {
+        VERSION_13
+    } else {
+        VERSION_12
+    };
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_12.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&(data.channels.len() as u32).to_le_bytes());
     encode_channel_directory(&mut out, &data.channels);
@@ -2014,21 +2175,9 @@ pub fn encode_regions(data: &RegionTerrainData) -> Result<Vec<u8>, SidecarError>
         out.extend_from_slice(&dial.to_le_bytes());
     }
 
-    // No colour map writes a zero scale and a zero side and nothing after.
-    match &data.colour_map {
-        Some(map) => {
-            out.push(map.scale);
-            out.extend_from_slice(&[0u8; 3]);
-            out.extend_from_slice(&map.side.to_le_bytes());
-            for texel in &map.texels {
-                out.extend_from_slice(texel);
-            }
-        }
-        None => {
-            out.push(0);
-            out.extend_from_slice(&[0u8; 3]);
-            out.extend_from_slice(&0u32.to_le_bytes());
-        }
+    encode_map_block(&mut out, data.colour_map.as_ref());
+    if version >= VERSION_13 {
+        encode_map_block(&mut out, data.normal_map.as_ref());
     }
 
     out.extend_from_slice(&(assets.iter().flatten().count() as u32).to_le_bytes());
@@ -2123,7 +2272,7 @@ pub fn decode_regions(bytes: &[u8]) -> Result<RegionTerrainData, SidecarError> {
         return Err(SidecarError::BadMagic);
     }
     let version = r.u16()?;
-    if !(VERSION_2..=VERSION_12).contains(&version) {
+    if !(VERSION_2..=VERSION_13).contains(&version) {
         return Err(SidecarError::UnsupportedVersion(version));
     }
     if r.u16()? != 0 {
@@ -2281,46 +2430,15 @@ pub fn decode_regions(bytes: &[u8]) -> Result<RegionTerrainData, SidecarError> {
         surface.sanitize();
     }
 
-    // Versions 11 and older carry no colour map.
+    // Versions 11 and older carry no colour map, and versions 12 and older no
+    // normal map.
     let mut colour_map = None;
     if version >= VERSION_12 {
-        let scale = r.u8()?;
-        if r.take(3)? != [0u8; 3] {
-            return Err(SidecarError::ReservedFieldSet);
-        }
-        let side = r.u32()?;
-        if scale == 0 {
-            // No map states no side; one that does means more than this
-            // build understands.
-            if side != 0 {
-                return Err(SidecarError::ReservedFieldSet);
-            }
-        } else {
-            // Checked before any texel is read, so a file claiming a huge map
-            // cannot make this reserve it.
-            if scale > MAX_COLOUR_MAP_SCALE {
-                return Err(SidecarError::InvalidColourMap(ColourMapError::BadScale(
-                    scale,
-                )));
-            }
-            if side == 0 || side > MAX_COLOUR_MAP_SIDE {
-                return Err(SidecarError::InvalidColourMap(ColourMapError::BadSide(
-                    side,
-                )));
-            }
-            let texels = (side as usize)
-                .checked_mul(side as usize)
-                .ok_or(SidecarError::TooLarge)?;
-            let texel_bytes = r.take(texels.checked_mul(4).ok_or(SidecarError::TooLarge)?)?;
-            colour_map = Some(ColourMap {
-                scale,
-                side,
-                texels: texel_bytes
-                    .chunks_exact(4)
-                    .map(|c| [c[0], c[1], c[2], c[3]])
-                    .collect(),
-            });
-        }
+        colour_map = decode_map_block(&mut r, SidecarError::InvalidColourMap)?;
+    }
+    let mut normal_map = None;
+    if version >= VERSION_13 {
+        normal_map = decode_map_block(&mut r, SidecarError::InvalidNormalMap)?;
     }
 
     // Versions 2 through 6 carry their scatter as scene entities and
@@ -2517,6 +2635,7 @@ pub fn decode_regions(bytes: &[u8]) -> Result<RegionTerrainData, SidecarError> {
         autoterrain,
         surface,
         colour_map,
+        normal_map,
         grid,
         scatter,
     })
@@ -2565,7 +2684,7 @@ pub fn load_from(bytes: &[u8], assets: Option<&Path>) -> Result<LoadedSidecar, S
     let mut data = match version {
         0 => Err(SidecarError::UnsupportedVersion(0)),
         VERSION => decode(bytes).and_then(|legacy| RegionTerrainData::from_legacy_v1(&legacy)),
-        VERSION_2..=VERSION_12 => decode_regions(bytes),
+        VERSION_2..=VERSION_13 => decode_regions(bytes),
         other => Err(SidecarError::UnsupportedVersion(other)),
     }?;
     data.normalize();
@@ -2599,8 +2718,9 @@ fn name_slots_as_paths(
     kept
 }
 
-/// Serialize a terrain document as the current format version. The inverse
-/// of [`load`] for any file [`load`] can produce.
+/// Serialize a terrain document as the oldest format version that can hold it:
+/// [`VERSION_13`] for a document with a normal map, [`VERSION_12`] for any
+/// other. The inverse of [`load`] for any file [`load`] can produce.
 pub fn save(data: &RegionTerrainData) -> Result<Vec<u8>, SidecarError> {
     encode_regions(data)
 }
@@ -2891,6 +3011,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         }
@@ -2922,6 +3043,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2932,6 +3054,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2949,6 +3072,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2965,6 +3089,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -2984,6 +3109,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3014,6 +3140,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3220,6 +3347,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3244,6 +3372,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3266,6 +3395,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3283,14 +3413,14 @@ mod tests {
     fn rejects_a_v2_file_written_by_a_newer_build() {
         let bytes = encode_regions(&sample_regions()).expect("encodes");
         let mut newer = bytes.clone();
-        newer[8..10].copy_from_slice(&(VERSION_12 + 1).to_le_bytes());
+        newer[8..10].copy_from_slice(&(VERSION_13 + 1).to_le_bytes());
         assert_eq!(
             decode_regions(&newer),
-            Err(SidecarError::UnsupportedVersion(VERSION_12 + 1))
+            Err(SidecarError::UnsupportedVersion(VERSION_13 + 1))
         );
         assert_eq!(
             load(&newer),
-            Err(SidecarError::UnsupportedVersion(VERSION_12 + 1))
+            Err(SidecarError::UnsupportedVersion(VERSION_13 + 1))
         );
     }
 
@@ -3460,6 +3590,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3482,6 +3613,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3506,6 +3638,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3559,6 +3692,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3593,6 +3727,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3623,6 +3758,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3651,6 +3787,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -3734,6 +3871,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -4155,11 +4293,10 @@ mod tests {
         assert_eq!(decode_regions(&long), Err(SidecarError::Truncated));
     }
 
-    /// The writer holds a map to the same limits the reader does.
-    #[test]
-    fn encode_refuses_a_colour_map_the_reader_would_refuse() {
+    /// Maps the format cannot store, with what is wrong with each.
+    fn unfit_maps() -> [(ColourMap, ColourMapError); 5] {
         let texels = |n: usize| vec![[0u8; 4]; n];
-        for (map, want) in [
+        [
             (
                 ColourMap {
                     scale: 0,
@@ -4203,7 +4340,13 @@ mod tests {
                     found: 3,
                 },
             ),
-        ] {
+        ]
+    }
+
+    /// The writer holds a map to the same limits the reader does.
+    #[test]
+    fn encode_refuses_a_colour_map_the_reader_would_refuse() {
+        for (map, want) in unfit_maps() {
             let data = RegionTerrainData {
                 colour_map: Some(map),
                 ..RegionTerrainData::default()
@@ -4212,6 +4355,335 @@ mod tests {
                 encode_regions(&data),
                 Err(SidecarError::InvalidColourMap(want))
             );
+        }
+    }
+
+    /// And holds a normal map to them too, saying which map it was.
+    #[test]
+    fn encode_refuses_a_normal_map_the_reader_would_refuse() {
+        for (map, want) in unfit_maps() {
+            let data = RegionTerrainData {
+                normal_map: Some(map),
+                ..RegionTerrainData::default()
+            };
+            assert_eq!(
+                encode_regions(&data),
+                Err(SidecarError::InvalidNormalMap(want))
+            );
+        }
+    }
+
+    /// A document that uses most of what version 12 carries: a slot with its own
+    /// texture colour, every surface dial moved, a colour layer, a 2 by 2 colour
+    /// map and a scatter palette with a placement behind it.
+    fn version_12_document() -> RegionTerrainData {
+        let mut regions = TerrainRegions::new(RegionSize::new(2).unwrap());
+        regions.set_height(0, 0, 3.0);
+        regions.set_color(0, 0, [9, 8, 7, 6]);
+        let mut data = RegionTerrainData {
+            regions,
+            materials: vec![TerrainMaterialSlot {
+                texture_colour: 0.5,
+                ..TerrainMaterialSlot::new("grass")
+            }],
+            surface: SurfaceSettings {
+                blend_sharpness: 0.75,
+                tint_strength: 0.25,
+                near_distance: 40.0,
+                far_distance: 200.0,
+                relief_depth: 0.125,
+                grain: 0.5,
+            },
+            colour_map: Some(
+                ColourMap::new(
+                    2,
+                    1,
+                    vec![
+                        [10, 20, 30, 255],
+                        [40, 50, 60, 255],
+                        [70, 80, 90, 255],
+                        [100, 110, 120, 255],
+                    ],
+                )
+                .expect("a 2 by 2 map"),
+            ),
+            scatter: ScatterPalette {
+                assets: vec![ScatterPaletteEntry::new("a.glb")],
+                groups: vec!["g".to_string()],
+            },
+            ..RegionTerrainData::default()
+        };
+        data.regions
+            .ensure_region(RegionCoord::ORIGIN)
+            .placements_mut()
+            .push(ScatterPlacement {
+                group: 0,
+                asset: 0,
+                x: 0.5,
+                y: 1.0,
+                z: 0.25,
+                yaw: 0.0,
+                scale: 1.0,
+            });
+        data
+    }
+
+    /// What the version-12 encoder wrote for [`version_12_document`], printed by
+    /// the build before version 13 existed. Not derived from this build's
+    /// encoder, which is the point of it.
+    const VERSION_12_BYTES: &[u8] = &[
+        0x4a, 0x44, 0x54, 0x45, 0x52, 0x52, 0x4e, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00,
+        0x00, 0x00, 0x67, 0x72, 0x61, 0x73, 0x73, 0xcd, 0xcc, 0xcc, 0x3d, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0xc8, 0x41, 0x00, 0x00, 0x20, 0x42, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x3f, 0x00, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x20, 0x42,
+        0x00, 0x00, 0x48, 0x43, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x3f, 0x01, 0x00, 0x00,
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x14, 0x1e, 0xff, 0x28, 0x32, 0x3c, 0xff, 0x46, 0x50,
+        0x5a, 0xff, 0x64, 0x6e, 0x78, 0xff, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x61,
+        0x2e, 0x67, 0x6c, 0x62, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x08, 0x07, 0x06, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3e,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
+    ];
+
+    /// A document without a normal map is written as version 12, byte for byte
+    /// as the version-12 encoder wrote it, and those bytes read back to it with
+    /// no normal map. Version 13 changes nothing for a file that has none.
+    #[test]
+    fn a_document_without_a_normal_map_encodes_byte_for_byte_as_version_12_did() {
+        let data = version_12_document();
+        assert!(data.normal_map.is_none());
+
+        let bytes = encode_regions(&data).expect("encodes");
+        assert_eq!(bytes, VERSION_12_BYTES);
+        assert_eq!(save(&data).expect("encodes"), VERSION_12_BYTES);
+        assert_eq!(data.encoded_len(), Some(VERSION_12_BYTES.len()));
+        assert_eq!(
+            u16::from_le_bytes([bytes[8], bytes[9]]),
+            VERSION_12,
+            "and under the version word it always had"
+        );
+
+        for back in [
+            decode_regions(VERSION_12_BYTES).expect("a version-12 file still decodes"),
+            load(VERSION_12_BYTES).expect("and loads"),
+        ] {
+            assert_eq!(back, data);
+            assert_eq!(back.normal_map, None);
+        }
+    }
+
+    /// The normal map sits behind the colour map and ahead of the scatter
+    /// palette, comes back exactly, and is the only thing that makes a file
+    /// version 13.
+    #[test]
+    fn version_13_round_trips_the_normal_map_behind_the_colour_map() {
+        let side = side_for(4, 2);
+        assert_eq!(side, 7);
+        let texels = (0..side * side)
+            .map(|i| {
+                let (x, z) = ((i % side) as f32 - 3.0, (i / side) as f32 - 3.0);
+                normal_texel(bevy_math::Vec3::new(x * 0.2, 1.0, z * 0.1))
+            })
+            .collect();
+        let normal_map = ColourMap::new(4, 2, texels).expect("a map the format can hold");
+        let without_colour = RegionTerrainData {
+            normal_map: Some(normal_map.clone()),
+            ..RegionTerrainData::default()
+        };
+        let with_colour = RegionTerrainData {
+            normal_map: Some(normal_map.clone()),
+            ..version_12_document()
+        };
+
+        for data in [without_colour, with_colour] {
+            let bytes = save(&data).expect("encodes");
+            assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), VERSION_13);
+            assert_eq!(bytes.len(), data.encoded_len().expect("fits"));
+            let back = load(&bytes).expect("loads");
+            assert_eq!(back, data);
+            assert_eq!(back.normal_map.as_ref(), Some(&normal_map));
+            assert_eq!(
+                back.colour_map, data.colour_map,
+                "the colour map is where it was"
+            );
+            assert_eq!(save(&back).expect("encodes again"), bytes);
+        }
+
+        // Behind the colour map's block and its texels, ahead of the palette,
+        // and nowhere else: the version-13 bytes are the version-12 document's
+        // with the block spliced in there and the version word turned over.
+        let at = VERSION_12_NORMAL_BLOCK_AT;
+        let block = COLOUR_MAP_HEADER_LEN + normal_map.texels.len() * 4;
+        let with = encode_regions(&RegionTerrainData {
+            normal_map: Some(normal_map),
+            ..version_12_document()
+        })
+        .expect("encodes");
+        assert_eq!(with.len(), VERSION_12_BYTES.len() + block);
+        assert_eq!(with[10..at], VERSION_12_BYTES[10..at]);
+        assert_eq!(with[at..at + 8], [2, 0, 0, 0, 7, 0, 0, 0]);
+        assert_eq!(with[at + block..], VERSION_12_BYTES[at..]);
+    }
+
+    /// Where a normal map block goes in [`VERSION_12_BYTES`]: behind the colour
+    /// map's 8-byte header, which starts at 117, and its four texels.
+    const VERSION_12_NORMAL_BLOCK_AT: usize = 117 + COLOUR_MAP_HEADER_LEN + 4 * 4;
+
+    /// The normal map's header is held to the colour map's limits, and a
+    /// failure names the map it is in.
+    #[test]
+    fn a_normal_map_header_the_format_cannot_hold_is_rejected() {
+        let data = RegionTerrainData {
+            normal_map: Some(ColourMap::new(2, 1, vec![UP_NORMAL_TEXEL; 4]).expect("a 2 by 2 map")),
+            ..RegionTerrainData::default()
+        };
+        let good = encode_regions(&data).expect("encodes");
+        // This document has no colour map, so that block is a bare header and
+        // the normal map's follows it.
+        let at = EMPTY_DOC_COLOUR_MAP_OFFSET + COLOUR_MAP_HEADER_LEN;
+        assert_eq!(
+            decode_regions(&good).expect("decodes"),
+            data,
+            "offset math must match the encoder"
+        );
+        let poisoned = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut bytes = good.clone();
+            edit(&mut bytes);
+            decode_regions(&bytes)
+        };
+        let set_side = |bytes: &mut Vec<u8>, side: u32| {
+            bytes[at + 4..at + 8].copy_from_slice(&side.to_le_bytes());
+        };
+        let bad = |reason: ColourMapError| -> Result<RegionTerrainData, SidecarError> {
+            Err(SidecarError::InvalidNormalMap(reason))
+        };
+
+        for scale in [5u8, 200] {
+            assert_eq!(
+                poisoned(&|b| b[at] = scale),
+                bad(ColourMapError::BadScale(scale))
+            );
+        }
+        for side in [0u32, 4097, u32::MAX] {
+            assert_eq!(
+                poisoned(&|b| set_side(b, side)),
+                bad(ColourMapError::BadSide(side))
+            );
+        }
+        for padding in 1..4 {
+            assert_eq!(
+                poisoned(&|b| b[at + padding] = 1),
+                Err(SidecarError::ReservedFieldSet)
+            );
+        }
+        // The largest side is allowed, and then the file is simply too short
+        // for it.
+        assert_eq!(
+            poisoned(&|b| set_side(b, MAX_COLOUR_MAP_SIDE)),
+            Err(SidecarError::Truncated)
+        );
+        // No map states no side.
+        assert_eq!(
+            poisoned(&|b| b[at] = 0),
+            Err(SidecarError::ReservedFieldSet)
+        );
+        // Texels short of the side, and bytes past the last one.
+        assert_eq!(
+            decode_regions(&good[..at + COLOUR_MAP_HEADER_LEN + 15]),
+            Err(SidecarError::Truncated)
+        );
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(decode_regions(&long), Err(SidecarError::Truncated));
+        // The colour map block ahead of it answers for itself.
+        assert_eq!(
+            poisoned(&|b| b[EMPTY_DOC_COLOUR_MAP_OFFSET] = 5),
+            Err(SidecarError::InvalidColourMap(ColourMapError::BadScale(5)))
+        );
+    }
+
+    /// A file cut short anywhere is refused, a version-13 file inside its normal
+    /// map block included, and so is one with a byte too many.
+    #[test]
+    fn a_version_13_file_cut_short_anywhere_is_truncated() {
+        let data = RegionTerrainData {
+            normal_map: Some(ColourMap::new(2, 1, vec![UP_NORMAL_TEXEL; 4]).expect("a 2 by 2 map")),
+            ..version_12_document()
+        };
+        let bytes = encode_regions(&data).expect("encodes");
+        assert_eq!(decode_regions(&bytes).expect("decodes"), data);
+        for end in 0..bytes.len() {
+            assert_eq!(
+                decode_regions(&bytes[..end]),
+                Err(SidecarError::Truncated),
+                "cut at {end} of {}",
+                bytes.len()
+            );
+        }
+        let mut long = bytes.clone();
+        long.push(0);
+        assert_eq!(decode_regions(&long), Err(SidecarError::Truncated));
+    }
+
+    /// A version-13 file that states no normal map, as an outside tool writes one
+    /// for a terrain without a normal map, is the document without one, and
+    /// saves back as version 12.
+    #[test]
+    fn a_version_13_file_that_states_no_normal_map_reads_as_none() {
+        let with = RegionTerrainData {
+            normal_map: Some(ColourMap::new(2, 1, vec![UP_NORMAL_TEXEL; 4]).expect("a 2 by 2 map")),
+            ..RegionTerrainData::default()
+        };
+        let mut bytes = encode_regions(&with).expect("encodes");
+        let at = EMPTY_DOC_COLOUR_MAP_OFFSET + COLOUR_MAP_HEADER_LEN;
+        // The block's header zeroed and its four texels gone.
+        bytes.drain(at + COLOUR_MAP_HEADER_LEN..at + COLOUR_MAP_HEADER_LEN + 16);
+        bytes[at..at + COLOUR_MAP_HEADER_LEN].fill(0);
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), VERSION_13);
+
+        let back = decode_regions(&bytes).expect("a version-13 file with no map decodes");
+        assert_eq!(back, RegionTerrainData::default());
+        let saved = save(&back).expect("encodes");
+        assert_eq!(u16::from_le_bytes([saved[8], saved[9]]), VERSION_12);
+        assert_eq!(
+            saved,
+            encode_regions(&RegionTerrainData::default()).expect("encodes")
+        );
+    }
+
+    /// The texel is the unit normal stored as `(x, z, y)`, each component as
+    /// `(v * 0.5 + 0.5) * 255` rounded.
+    #[test]
+    fn a_normal_texel_stores_the_terrain_normal_as_x_z_y() {
+        use bevy_math::Vec3;
+
+        assert_eq!(normal_texel(Vec3::Y), UP_NORMAL_TEXEL);
+        assert_eq!(normal_texel(Vec3::X), [255, 128, 128, 255]);
+        assert_eq!(normal_texel(-Vec3::X), [0, 128, 128, 255]);
+        assert_eq!(normal_texel(Vec3::Z), [128, 255, 128, 255]);
+        assert_eq!(
+            normal_texel(Vec3::new(1.0, 1.0, 0.0)),
+            [218, 128, 218, 255],
+            "45 degrees toward +x"
+        );
+        assert_eq!(
+            normal_texel(Vec3::new(0.0, 7.0, 0.0)),
+            UP_NORMAL_TEXEL,
+            "any length"
+        );
+        for unusable in [
+            Vec3::ZERO,
+            Vec3::new(f32::NAN, 1.0, 0.0),
+            Vec3::splat(f32::INFINITY),
+        ] {
+            assert_eq!(normal_texel(unusable), UP_NORMAL_TEXEL, "{unusable}");
         }
     }
 
@@ -4413,6 +4885,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         }
@@ -5086,6 +5559,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
             ..RegionTerrainData::default()
@@ -5162,6 +5636,7 @@ mod tests {
                 side: 2,
                 texels: vec![[1, 2, 3, 4]; 4],
             }),
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             // One palette entry, one group key and one placement below,
             // so the version-7 boundaries are walked too.
@@ -5347,6 +5822,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -5394,6 +5870,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -5422,6 +5899,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -5443,6 +5921,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
@@ -5548,6 +6027,7 @@ mod tests {
             autoterrain: AutoTerrainSettings::default(),
             surface: SurfaceSettings::default(),
             colour_map: None,
+            normal_map: None,
             grid: Some(GridGeometry::DEFAULT),
             scatter: ScatterPalette::default(),
         };
