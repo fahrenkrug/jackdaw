@@ -8,5 +8,6 @@ mod util;
 
 mod terrain_detail;
 mod terrain_export;
+mod terrain_gpu;
 mod terrain_reload;
 mod terrain_stamp;
