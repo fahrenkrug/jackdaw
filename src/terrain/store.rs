@@ -292,16 +292,26 @@ impl TerrainDataStore {
 
     /// Sets how far apart a document's cells sit, keeping where they sit: a
     /// lateral rescale of the same cells over more or less ground.
+    ///
+    /// Every slope changes with the spacing, so a baked normal map no longer
+    /// describes any of the ground: it is masked whole, which lights the terrain
+    /// from its mesh until the next bake (see [`Self::normal_map`]).
     pub fn set_cell_size(&mut self, data_path: &str, cell_size: f32) {
-        let anchor = self
-            .grid(data_path)
-            .map(|grid| grid.anchor)
-            .unwrap_or_default();
+        let was = self.grid(data_path);
+        let anchor = was.map(|grid| grid.anchor).unwrap_or_default();
         self.set_grid(
             data_path,
             jackdaw_terrain::sidecar::GridGeometry { cell_size, anchor },
         );
         self.retire_heightmap(data_path);
+        if was.map(|grid| grid.cell_size) != Some(cell_size) {
+            let whole = GridRect::whole(self.grid_resolution(data_path));
+            if let Some(data) = self.entries.get_mut(data_path)
+                && mask_baked_normals(data, whole)
+            {
+                self.mark_colour_map_dirty(data_path);
+            }
+        }
     }
 
     /// Records the geometry a document's cells are drawn at, so every later
@@ -2787,5 +2797,23 @@ mod tests {
             .set_heights(&[2.0; 256]);
 
         assert!(!store.take_colour_map_dirty("a.jdterrain"));
+    }
+
+    /// Respacing the cells changes every slope, so the whole baked normal map is
+    /// masked and marked for upload; setting the spacing it already has costs
+    /// the map nothing.
+    #[test]
+    fn respacing_the_cells_masks_the_whole_normal_map() {
+        let subject = terrain(16, "a.jdterrain");
+        let mut store = store_with_normal_map(&subject, 2);
+        let spacing = store.grid("a.jdterrain").map_or(1.0, |grid| grid.cell_size);
+
+        store.set_cell_size("a.jdterrain", spacing);
+        assert!(masked_texels(&store, "a.jdterrain").is_empty());
+        assert!(!store.take_colour_map_dirty("a.jdterrain"));
+
+        store.set_cell_size("a.jdterrain", spacing * 2.0);
+        assert_eq!(masked_texels(&store, "a.jdterrain"), block(0..=30, 0..=30));
+        assert!(store.take_colour_map_dirty("a.jdterrain"));
     }
 }
