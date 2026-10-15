@@ -189,6 +189,29 @@ how many times the texture repeats per world unit; Detiling
 breaks up that repetition by turning and shifting individual
 tiles -- 0 is off.
 
+Ground steeper than about 46 degrees is textured from the sides
+as well as from above, so cliffs show their texture upright
+rather than stretched down the slope.
+
+The **Ground** section shades the terrain by distance from the
+camera:
+
+- Within **Near distance** (30 m by default), **Relief** gives
+  the dominant texture parallax depth in metres, and **Grain**
+  lays its light and dark back over a colour map. Both are off
+  at 0.
+- Past **Far distance** (150 m) the ground stops reading its
+  normal, occlusion and roughness maps and shades from each
+  slot's average, which is cheaper.
+
+A terrain baked with a colour map (sidecar version 12, written by
+an outside tool such as a terrain generator) takes its colour
+from that map and the light and dark from its textures. Each
+slot's **Texture colour** says how much of its own colour it
+keeps: 1 is the texture as it is, 0 is the map's colour with the
+texture's grain. Relief, grain and the colour map are compiled
+into a terrain's shader only when it uses them.
+
 ## Autoterrain
 
 Autoterrain textures the cells you have not painted from the
