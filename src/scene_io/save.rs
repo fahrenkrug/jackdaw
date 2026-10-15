@@ -2035,6 +2035,88 @@ mod terrain_sidecar_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// A colour map is baked outside the editor and carried beside the paint, and
+    /// the near and far dials and each slot's texture colour are authored in the
+    /// same file. Editing the ground and saving must keep every one of them, and
+    /// a reopened editor must mark the map for upload, or it never reaches the
+    /// material.
+    #[test]
+    fn a_colour_map_and_the_new_dials_survive_an_edit_a_save_and_a_reload() {
+        use jackdaw_terrain::Control;
+        use jackdaw_terrain::sidecar::{ColourMap, SurfaceSettings, TerrainMaterialSlot};
+
+        let tmp = unique_tmp_dir("colour-map-roundtrip");
+        let scene_path = tmp.join("zone.bsn");
+        let data_path = "zone.terrain-0.jdterrain";
+        let terrain = jackdaw_scene_types::Terrain {
+            resolution: 4,
+            data_path: data_path.to_string(),
+            ..default()
+        };
+        // Two texels a grid cell over four grid points is seven texels an edge.
+        let map =
+            ColourMap::new(4, 2, vec![[10, 200, 30, 255]; 49]).expect("a map the format holds");
+        let surface = SurfaceSettings {
+            near_distance: 45.0,
+            far_distance: 300.0,
+            relief_depth: 0.125,
+            grain: 0.5,
+            ..default()
+        };
+
+        let mut world = World::new();
+        world.insert_resource(store_holding(&terrain));
+        world.spawn(terrain.clone());
+        {
+            let mut store = world.resource_mut::<TerrainDataStore>();
+            store
+                .set_materials(
+                    data_path,
+                    vec![TerrainMaterialSlot {
+                        texture_colour: 0.25,
+                        ..TerrainMaterialSlot::new("grass")
+                    }],
+                )
+                .expect("plain material names are accepted");
+            store.set_surface(data_path, surface).expect("a keyed path");
+            store.document_mut(data_path).expect("authored").colour_map = Some(map.clone());
+
+            // The ground is edited after the bake, by the same views a brush uses.
+            store
+                .entry_for(&terrain)
+                .expect("keyed")
+                .set_heights(&sculpted().heights);
+            store.control_mut(&terrain).expect("keyed")[5] = Control::default().with_base_id(1);
+        }
+
+        export_terrain_sidecars(&mut world, &scene_path.to_string_lossy()).expect("save succeeds");
+
+        let mut reopened = World::new();
+        reopened.insert_resource(TerrainDataStore::default());
+        reopened.spawn(terrain.clone());
+        crate::scene_io::import_terrain_sidecars(
+            &mut reopened,
+            &scene_path.to_string_lossy(),
+            crate::scene_io::SidecarImport::Reload,
+        );
+
+        let store = reopened.resource::<TerrainDataStore>();
+        assert_eq!(store.colour_map(data_path), Some(&map));
+        assert_eq!(store.surface(data_path), surface);
+        assert_eq!(store.materials(data_path)[0].texture_colour, 0.25);
+        assert_eq!(store.heights(data_path), sculpted().heights.as_slice());
+        assert!(
+            store.take_colour_map_dirty(data_path),
+            "a loaded colour map must be marked for upload, or it never reaches the material",
+        );
+        assert!(
+            !store.take_colour_map_dirty(data_path),
+            "and the mark is taken, not left",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// 129 vertices per edge is 2^7 + 1, so no single power-of-two region holds it. It has
     /// to open, be editable, and round-trip every height, seam row included.
     #[test]
