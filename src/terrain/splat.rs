@@ -372,11 +372,15 @@ fn build_ready_materials(
         let surface = store.surface(&terrain.data_path);
         let texture_colours = slot_colours(store.materials(&terrain.data_path));
         // Built from the document as it stands, which is also what clears the
-        // mark `refresh_colour_maps` would upload the same map for.
+        // mark `refresh_colour_maps` would upload the same maps for. The normal
+        // map comes with the document as the colour map does, so the one mark is
+        // for both.
         store.take_colour_map_dirty(&terrain.data_path);
         let colour_map =
             ColourMapBinding::upload(store.colour_map(&terrain.data_path), &mut images);
-        let material = splat_materials.add(TerrainSplatMaterial::new(
+        let normal_map =
+            ColourMapBinding::upload_normals(store.normal_map(&terrain.data_path), &mut images);
+        let mut built_material = TerrainSplatMaterial::new(
             &entry.set,
             &texture_colours,
             arrays,
@@ -388,7 +392,9 @@ fn build_ready_materials(
             shape.resolution,
             autoterrain,
             surface,
-        ));
+        );
+        built_material.set_normal_map(normal_map);
+        let material = splat_materials.add(built_material);
         entry.built_texture_colours = texture_colours;
         entry.slope = Some(slope);
         entry.slope_heights = Some(heights);
@@ -496,13 +502,13 @@ fn refresh_surface(
     }
 }
 
-/// Follow a terrain's colour map into the material it draws with.
+/// Follow a terrain's colour map and normal map into the material it draws with.
 ///
-/// A map arrives with its document and is never edited in place, so the store
-/// only says that one was replaced. The image is rebuilt whole and the material
-/// pointed at it, which is also what makes the bind group pick it up. An entry
-/// with no material yet is left alone, and keeps the mark, so the map reaches it
-/// through `build_ready_materials`.
+/// The maps arrive with their document and are never edited in place, so the
+/// store only says that they were replaced, once for both. The images are
+/// rebuilt whole and the material pointed at them, which is also what makes the
+/// bind group pick them up. An entry with no material yet is left alone, and
+/// keeps the mark, so the maps reach it through `build_ready_materials`.
 fn refresh_colour_maps(
     materials: Res<TerrainSplatMaterials>,
     mut splat_materials: ResMut<Assets<TerrainSplatMaterial>>,
@@ -524,8 +530,12 @@ fn refresh_colour_maps(
         if !store.take_colour_map_dirty(&terrain.data_path) {
             continue;
         }
-        let binding = ColourMapBinding::upload(store.colour_map(&terrain.data_path), &mut images);
-        material.set_colour_map(binding);
+        let colour_map =
+            ColourMapBinding::upload(store.colour_map(&terrain.data_path), &mut images);
+        material.set_colour_map(colour_map);
+        let normal_map =
+            ColourMapBinding::upload_normals(store.normal_map(&terrain.data_path), &mut images);
+        material.set_normal_map(normal_map);
     }
 }
 

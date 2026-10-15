@@ -17,8 +17,8 @@
 //!
 //! The scenes between them turn on every optional part of the shader that the
 //! material's pipeline key switches (the plain ground none, the colour map, the
-//! grain and the relief one or more), so each of those variants is built on the
-//! device too.
+//! grain, the relief and the normal map one or more), so each of those variants
+//! is built on the device too.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -40,7 +40,9 @@ use jackdaw_terrain::render::{
     ColourMapBinding, SplatArrayHandles, TerrainRenderPlugin, TerrainSplatMaterial,
     TextureSetImages, control_image, slope_image, splat_images, tint_image,
 };
-use jackdaw_terrain::sidecar::{AutoTerrainSettings, ColourMap, SurfaceSettings};
+use jackdaw_terrain::sidecar::{
+    AutoTerrainSettings, ColourMap, SurfaceSettings, normal_texel, side_for,
+};
 use jackdaw_terrain::splat::ControlTexels;
 use jackdaw_terrain::texture_set::{TextureSet, TextureSetEntry};
 use jackdaw_terrain::{Control, Heightmap};
@@ -268,6 +270,9 @@ struct Staged {
 struct Shot {
     /// Linear RGB per pixel, row-major, top row first.
     pixels: Vec<Vec3>,
+    /// The same pixels as the bytes the target holds, for what has to match to
+    /// the last one.
+    bytes: Vec<[u8; 3]>,
 }
 
 impl Shot {
@@ -281,7 +286,11 @@ impl Shot {
                 Vec3::new(linear.red, linear.green, linear.blue)
             })
             .collect();
-        Self { pixels }
+        let bytes = data
+            .chunks_exact(4)
+            .map(|texel| [texel[0], texel[1], texel[2]])
+            .collect();
+        Self { pixels, bytes }
     }
 
     fn at(&self, x: u32, y: u32) -> Vec3 {
@@ -342,6 +351,17 @@ impl Shot {
             / self.pixels.len() as f32
     }
 
+    /// The most any channel of any pixel differs by between two shots, in the
+    /// bytes of the target: 1 is 1/255.
+    fn max_byte_difference(&self, other: &Shot) -> u8 {
+        self.bytes
+            .iter()
+            .zip(&other.bytes)
+            .flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| a.abs_diff(*b)))
+            .max()
+            .unwrap_or(0)
+    }
+
     fn finite_and_lit(&self) -> bool {
         self.pixels.iter().all(|p| p.is_finite())
             && self.mean((0, 0), (SIDE, SIDE)).max_element() > 0.01
@@ -374,6 +394,42 @@ impl Pattern {
     }
 }
 
+/// Texels a grid cell of the normal maps below carry.
+const NORMAL_SCALE: u8 = 4;
+
+/// A normal map baked for the plate, finer than its grid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NormalMap {
+    /// Straight up everywhere: the flat ground the mesh already is.
+    Up,
+    /// A crease down the middle along Z: the half before it leans toward +X at
+    /// 45 degrees and the half after it toward -X, over a mesh that is flat.
+    CreaseX,
+    /// The same along X, the half before it leaning toward +Z.
+    CreaseZ,
+}
+
+impl NormalMap {
+    /// The map as the sidecar carries it, over `RESOLUTION` grid points.
+    fn map(self) -> ColourMap {
+        let side = side_for(RESOLUTION, NORMAL_SCALE);
+        let middle = (side - 1) / 2;
+        // +1 before the middle, -1 after it, 0 on it.
+        let lean = |at: u32| (middle as f32 - at as f32).signum() * f32::from(at != middle);
+        let texels = (0..side * side)
+            .map(|index| {
+                let (x, z) = (index % side, index / side);
+                normal_texel(match self {
+                    Self::Up => Vec3::Y,
+                    Self::CreaseX => Vec3::new(lean(x), 1.0, 0.0),
+                    Self::CreaseZ => Vec3::new(0.0, 1.0, lean(z)),
+                })
+            })
+            .collect();
+        ColourMap::new(RESOLUTION, NORMAL_SCALE, texels).expect("a map the format holds")
+    }
+}
+
 /// One thing to look at, and how its ground is shaded.
 #[derive(Clone)]
 struct Spec {
@@ -392,6 +448,8 @@ struct Spec {
     detile: f32,
     texture_colour: f32,
     colour_map: Option<[u8; 3]>,
+    /// The normal map the ground is lit from, if it has one.
+    normal_map: Option<NormalMap>,
     surface: SurfaceSettings,
     /// The direction a directional light shines in, if there is one.
     light: Option<Vec3>,
@@ -411,6 +469,7 @@ impl Spec {
             detile: 0.0,
             texture_colour: 1.0,
             colour_map: None,
+            normal_map: None,
             surface: SurfaceSettings::default(),
             light: None,
         }
@@ -513,7 +572,9 @@ impl Spec {
                 .expect("a map the format holds")
             });
             let colour_map = ColourMapBinding::upload(map.as_ref(), &mut images);
-            materials.add(TerrainSplatMaterial::new(
+            let normals = self.normal_map.map(NormalMap::map);
+            let normal_map = ColourMapBinding::upload_normals(normals.as_ref(), &mut images);
+            let mut material = TerrainSplatMaterial::new(
                 &set,
                 &colours,
                 arrays,
@@ -525,9 +586,32 @@ impl Spec {
                 RESOLUTION,
                 AutoTerrainSettings::default(),
                 self.surface,
-            ))
+            );
+            material.set_normal_map(normal_map);
+            materials.add(material)
         })
     }
+}
+
+/// Point a material that is already on screen at a normal map, or at none, and
+/// let it reach the GPU.
+fn bind_normal_map(
+    gpu: &mut Gpu,
+    material: &Handle<TerrainSplatMaterial>,
+    normal_map: Option<NormalMap>,
+) {
+    let normals = normal_map.map(NormalMap::map);
+    let binding = gpu
+        .world()
+        .resource_scope(|_, mut images: Mut<Assets<Image>>| {
+            ColourMapBinding::upload_normals(normals.as_ref(), &mut images)
+        });
+    gpu.world()
+        .resource_mut::<Assets<TerrainSplatMaterial>>()
+        .get_mut(material)
+        .expect("the material is still there")
+        .set_normal_map(binding);
+    gpu.settle();
 }
 
 /// A square image whose texel at `(x, y)` is `texel(x, y)`.
@@ -822,6 +906,136 @@ fn the_splat_shader_renders_on_a_gpu() {
         uneven > 0.02 && even < 0.3 * uneven,
         "the far band lights tilted tiles alike: spread {uneven} close, {even} far"
     );
+
+    // A normal map lights the ground per pixel in place of the mesh's normals,
+    // which on this plate are all straight up. A crease down the middle, each
+    // half leaning toward the other, lit from the side: the half that faces the
+    // light is bright and the half turned from it is not.
+    let creased = Spec {
+        normal_map: Some(NormalMap::CreaseX),
+        light: Some(Vec3::new(-1.0, -0.35, 0.0).normalize()),
+        ..ground.clone()
+    };
+    let by_mesh = gpu.shoot(
+        "normal_map_none",
+        &Spec {
+            normal_map: None,
+            ..creased.clone()
+        },
+    );
+    let folded = gpu.shoot("normal_map_crease_x", &creased);
+    assert!(
+        by_mesh.finite_and_lit() && folded.finite_and_lit(),
+        "a normal map renders lit"
+    );
+    // X runs to the right of the picture. The light shines toward -X, so it
+    // lights what faces +X: the left half, which leans that way.
+    let (facing, turned_away) = (
+        luminance(folded.mean((16, 40), (56, 88))),
+        luminance(folded.mean((72, 40), (112, 88))),
+    );
+    assert!(
+        facing > 2.0 * turned_away,
+        "the half of the crease that faces the light is the bright one: {facing} against {turned_away}"
+    );
+    assert!(
+        by_mesh.difference(&folded) > 0.02,
+        "the normal map changed nothing: {}",
+        by_mesh.difference(&folded)
+    );
+    // And it is the map that does it: a mesh that says up everywhere lights
+    // both halves alike.
+    let (left, right) = (
+        luminance(by_mesh.mean((16, 40), (56, 88))),
+        luminance(by_mesh.mean((72, 40), (112, 88))),
+    );
+    assert!(
+        (left - right).abs() < 0.05 * left.max(right),
+        "the mesh's own normals light the plate evenly: {left} against {right}"
+    );
+
+    // The same along Z, which runs down the picture: the light shines toward -Z
+    // and lights the half that leans toward +Z, the top.
+    let folded_z = gpu.shoot(
+        "normal_map_crease_z",
+        &Spec {
+            normal_map: Some(NormalMap::CreaseZ),
+            light: Some(Vec3::new(0.0, -0.35, -1.0).normalize()),
+            ..ground.clone()
+        },
+    );
+    let (top, bottom) = (
+        luminance(folded_z.mean((40, 16), (88, 56))),
+        luminance(folded_z.mean((40, 72), (88, 112))),
+    );
+    assert!(
+        top > 2.0 * bottom,
+        "the half of the crease that faces the light is the bright one: {top} against {bottom}"
+    );
+
+    // A map that says up everywhere is the ground the mesh already is, to the
+    // last byte of the target.
+    let straight_up = gpu.shoot(
+        "normal_map_up",
+        &Spec {
+            normal_map: Some(NormalMap::Up),
+            ..creased.clone()
+        },
+    );
+    assert!(
+        straight_up.max_byte_difference(&by_mesh) <= 1,
+        "a normal map that is straight up changed the picture by {}/255",
+        straight_up.max_byte_difference(&by_mesh)
+    );
+
+    // The map is in the terrain's own axes: a terrain turned about Y, seen by a
+    // camera and lit by a light turned with it, is the same picture.
+    let turned_crease = gpu.shoot(
+        "normal_map_crease_turned",
+        &Spec {
+            placement: Transform::from_rotation(turn),
+            eye: looking(
+                turn * Vec3::new(0.0, 4.0, 0.01),
+                Vec3::ZERO,
+                turn * Vec3::NEG_Z,
+            ),
+            light: creased.light.map(|shining| turn * shining),
+            ..creased.clone()
+        },
+    );
+    assert!(
+        folded.difference(&turned_crease) < 0.02,
+        "a turned terrain lights its normal map the same: {}",
+        folded.difference(&turned_crease)
+    );
+
+    // The editor hands a material on screen a normal map, and takes it away
+    // again. The pipeline is keyed on whether it has one, so each has to switch
+    // the variant under a live material.
+    let staged = gpu.stage(&Spec {
+        normal_map: None,
+        ..creased.clone()
+    });
+    let before = gpu.photograph("live_normal_map_off");
+    bind_normal_map(&mut gpu, &staged.material, Some(NormalMap::CreaseX));
+    let live = gpu.photograph("live_normal_map_on");
+    assert!(
+        before.difference(&live) > 0.02,
+        "a live material ignored its new normal map: {}",
+        before.difference(&live)
+    );
+    assert!(
+        live.max_byte_difference(&folded) <= 1,
+        "a live normal map lights as one the material was built with"
+    );
+    bind_normal_map(&mut gpu, &staged.material, None);
+    let after = gpu.photograph("live_normal_map_off_again");
+    assert!(
+        after.max_byte_difference(&before) <= 1,
+        "a normal map taken away draws what it drew before: {}/255",
+        after.max_byte_difference(&before)
+    );
+    gpu.strike(staged);
 
     // Relief moves where the textures are read, and leaves the ground lit, with
     // and without detiling.

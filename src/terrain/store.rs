@@ -119,10 +119,11 @@ pub struct TerrainDataStore {
     /// renderer last uploaded it. Kept beside [`Self::control_dirty`], and
     /// behind a lock for the same reason.
     tint_dirty: Mutex<HashMap<String, GridRect>>,
-    /// Which terrains' colour maps have been replaced since the renderer last
-    /// uploaded them. A map is never edited in place, so a mark is all there is
-    /// to say about it. Beside the other dirty marks, and behind a lock for the
-    /// same reason.
+    /// Which terrains' colour maps and normal maps have been replaced since the
+    /// renderer last uploaded them. The maps arrive together with their
+    /// document and are never edited in place, so one mark for both is all there
+    /// is to say about them. Beside the other dirty marks, and behind a lock for
+    /// the same reason.
     colour_map_dirty: Mutex<HashSet<String>>,
     /// Which of each terrain's regions have had their stored scatter written
     /// since the renderer last drew them. Beside the other dirty marks, and
@@ -1054,7 +1055,16 @@ impl TerrainDataStore {
         self.entries.get(data_path)?.colour_map.as_ref()
     }
 
-    /// Records that a terrain's colour map needs uploading.
+    /// A terrain's normal map, baked outside the editor and carried with its
+    /// document. `None` for a terrain with no document or no map.
+    ///
+    /// It arrives with the document as the colour map does, so
+    /// [`Self::take_colour_map_dirty`] covers both.
+    pub fn normal_map(&self, data_path: &str) -> Option<&ColourMap> {
+        self.entries.get(data_path)?.normal_map.as_ref()
+    }
+
+    /// Records that a terrain's colour map and normal map need uploading.
     fn mark_colour_map_dirty(&self, data_path: &str) {
         self.colour_map_dirty
             .lock()
@@ -1062,11 +1072,11 @@ impl TerrainDataStore {
             .insert(data_path.to_string());
     }
 
-    /// Whether a terrain's colour map has been replaced since this was last
-    /// called, clearing the mark.
+    /// Whether a terrain's colour map and normal map have been replaced since
+    /// this was last called, clearing the mark.
     ///
-    /// The renderer calls this only once it has somewhere to upload to, so a map
-    /// that arrives before the material exists keeps its mark until then.
+    /// The renderer calls this only once it has somewhere to upload to, so maps
+    /// that arrive before the material exists keep their mark until then.
     pub fn take_colour_map_dirty(&self, data_path: &str) -> bool {
         self.colour_map_dirty
             .lock()

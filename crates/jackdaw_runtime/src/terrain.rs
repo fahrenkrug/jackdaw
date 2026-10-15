@@ -408,9 +408,13 @@ fn build_ready_materials(
         // The colour map is one white texel where the terrain has none, which
         // the shader never reads.
         let colour_map = ColourMapBinding::upload(document.data.colour_map.as_ref(), &mut images);
+        // Likewise the normal map: one straight-up texel where there is none,
+        // and the mesh's normals light the terrain.
+        let normal_map =
+            ColourMapBinding::upload_normals(document.data.normal_map.as_ref(), &mut images);
         let texture_colours: Vec<f32> =
             splat.slots.iter().map(|slot| slot.texture_colour).collect();
-        splat.material = Some(splat_materials.add(TerrainSplatMaterial::new(
+        let mut material = TerrainSplatMaterial::new(
             &splat.set,
             &texture_colours,
             arrays,
@@ -422,7 +426,9 @@ fn build_ready_materials(
             shape.resolution,
             document.data.autoterrain,
             document.data.surface,
-        )));
+        );
+        material.set_normal_map(normal_map);
+        splat.material = Some(splat_materials.add(material));
         splat.built_size = shape.size;
         splat.built_resolution = shape.resolution;
         splat.reported = false;

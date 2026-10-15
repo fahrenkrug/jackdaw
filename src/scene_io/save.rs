@@ -2035,15 +2035,17 @@ mod terrain_sidecar_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// A colour map is baked outside the editor and carried beside the paint, and
-    /// the near and far dials and each slot's texture colour are authored in the
-    /// same file. Editing the ground and saving must keep every one of them, and
-    /// a reopened editor must mark the map for upload, or it never reaches the
-    /// material.
+    /// A colour map and a normal map are baked outside the editor and carried
+    /// beside the paint, and the near and far dials and each slot's texture
+    /// colour are authored in the same file. Editing the ground and saving must
+    /// keep every one of them, and a reopened editor must mark the maps for
+    /// upload, or they never reach the material.
     #[test]
-    fn a_colour_map_and_the_new_dials_survive_an_edit_a_save_and_a_reload() {
+    fn the_colour_map_the_normal_map_and_the_dials_survive_an_edit_a_save_and_a_reload() {
         use jackdaw_terrain::Control;
-        use jackdaw_terrain::sidecar::{ColourMap, SurfaceSettings, TerrainMaterialSlot};
+        use jackdaw_terrain::sidecar::{
+            ColourMap, SurfaceSettings, TerrainMaterialSlot, normal_texel,
+        };
 
         let tmp = unique_tmp_dir("colour-map-roundtrip");
         let scene_path = tmp.join("zone.bsn");
@@ -2056,6 +2058,9 @@ mod terrain_sidecar_tests {
         // Two texels a grid cell over four grid points is seven texels an edge.
         let map =
             ColourMap::new(4, 2, vec![[10, 200, 30, 255]; 49]).expect("a map the format holds");
+        // The normal map is as fine, and leans toward +X.
+        let normals = ColourMap::new(4, 2, vec![normal_texel(Vec3::new(1.0, 1.0, 0.0)); 49])
+            .expect("a map the format holds");
         let surface = SurfaceSettings {
             near_distance: 45.0,
             far_distance: 300.0,
@@ -2079,7 +2084,9 @@ mod terrain_sidecar_tests {
                 )
                 .expect("plain material names are accepted");
             store.set_surface(data_path, surface).expect("a keyed path");
-            store.document_mut(data_path).expect("authored").colour_map = Some(map.clone());
+            let document = store.document_mut(data_path).expect("authored");
+            document.colour_map = Some(map.clone());
+            document.normal_map = Some(normals.clone());
 
             // The ground is edited after the bake, by the same views a brush uses.
             store
@@ -2090,6 +2097,12 @@ mod terrain_sidecar_tests {
         }
 
         export_terrain_sidecars(&mut world, &scene_path.to_string_lossy()).expect("save succeeds");
+        let written = std::fs::read(tmp.join(data_path)).expect("the sidecar is written");
+        assert_eq!(
+            u16::from_le_bytes([written[8], written[9]]),
+            sidecar::VERSION_13,
+            "a terrain with a normal map is a version-13 file"
+        );
 
         let mut reopened = World::new();
         reopened.insert_resource(TerrainDataStore::default());
@@ -2102,12 +2115,13 @@ mod terrain_sidecar_tests {
 
         let store = reopened.resource::<TerrainDataStore>();
         assert_eq!(store.colour_map(data_path), Some(&map));
+        assert_eq!(store.normal_map(data_path), Some(&normals));
         assert_eq!(store.surface(data_path), surface);
         assert_eq!(store.materials(data_path)[0].texture_colour, 0.25);
         assert_eq!(store.heights(data_path), sculpted().heights.as_slice());
         assert!(
             store.take_colour_map_dirty(data_path),
-            "a loaded colour map must be marked for upload, or it never reaches the material",
+            "loaded maps must be marked for upload, or they never reach the material",
         );
         assert!(
             !store.take_colour_map_dirty(data_path),

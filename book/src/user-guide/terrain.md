@@ -212,6 +212,14 @@ keeps: 1 is the texture as it is, 0 is the map's colour with the
 texture's grain. Relief, grain and the colour map are compiled
 into a terrain's shader only when it uses them.
 
+A terrain baked with a normal map (sidecar version 13, written by
+an outside terrain tool) is lit per pixel from that map rather
+than from the mesh, so fine relief and the edges between detail
+levels light evenly. The map can be finer than the grid, built
+from a finer heightfield than the mesh has, and the textures'
+own normal maps are laid over it as before. It is compiled into
+the shader like the others, only for a terrain that has one.
+
 ## Autoterrain
 
 Autoterrain textures the cells you have not painted from the
