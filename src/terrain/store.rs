@@ -119,11 +119,12 @@ pub struct TerrainDataStore {
     /// renderer last uploaded it. Kept beside [`Self::control_dirty`], and
     /// behind a lock for the same reason.
     tint_dirty: Mutex<HashMap<String, GridRect>>,
-    /// Which terrains' colour maps and normal maps have been replaced since the
-    /// renderer last uploaded them. The maps arrive together with their
-    /// document and are never edited in place, so one mark for both is all there
-    /// is to say about them. Beside the other dirty marks, and behind a lock for
-    /// the same reason.
+    /// Which terrains' colour maps and normal maps have to be uploaded again
+    /// since the renderer last did: they arrived together with their document, or
+    /// an edit to the heights masked the normal map over the ground it changed.
+    /// The images are rebuilt whole either way, so one mark for both maps is all
+    /// there is to say about them. Beside the other dirty marks, and behind a lock
+    /// for the same reason.
     colour_map_dirty: Mutex<HashSet<String>>,
     /// Which of each terrain's regions have had their stored scatter written
     /// since the renderer last drew them. Beside the other dirty marks, and
@@ -423,6 +424,10 @@ impl TerrainDataStore {
     /// that flattens the terrain's one peak leaves the range taller than the
     /// terrain until the next full rebuild tightens it.
     ///
+    /// A baked normal map no longer describes the ground under `rect`: its alpha
+    /// is zeroed there, and one cell around, so that ground is lit from the mesh
+    /// (see [`Self::normal_map`]).
+    ///
     /// `false` when the terrain has no document to write.
     pub fn brush_heights(
         &mut self,
@@ -434,6 +439,7 @@ impl TerrainDataStore {
             entries,
             load_failed,
             heightmaps,
+            colour_map_dirty,
             ..
         } = self;
         let Some(data) = Self::document_in(entries, load_failed, terrain) else {
@@ -454,6 +460,9 @@ impl TerrainDataStore {
                 Some(heights)
             }
         };
+        if mask_baked_normals(data, rect) {
+            mark_maps_dirty(colour_map_dirty, &terrain.data_path);
+        }
         let heights = match &gathered {
             Some(heights) => heights.as_slice(),
             None => data
@@ -653,7 +662,9 @@ impl TerrainDataStore {
         // An entry is handed out to be written through, so this terrain's
         // cached heightmap is stale from here whether the caller writes or not.
         self.retire_heightmap(&terrain.data_path);
-        Self::document_in(&mut self.entries, &self.load_failed, terrain).map(TerrainEntry::new)
+        let maps_dirty = &self.colour_map_dirty;
+        Self::document_in(&mut self.entries, &self.load_failed, terrain)
+            .map(|data| TerrainEntry::new(data, maps_dirty, &terrain.data_path))
     }
 
     /// A terrain's document by sidecar path, writable.
@@ -1059,21 +1070,23 @@ impl TerrainDataStore {
     /// document. `None` for a terrain with no document or no map.
     ///
     /// It arrives with the document as the colour map does, so
-    /// [`Self::take_colour_map_dirty`] covers both.
+    /// [`Self::take_colour_map_dirty`] covers both. Unlike the colour map it is
+    /// edited in place: a write to the heights zeroes the alpha of the texels
+    /// over the cells it changed, and one cell around, which lights that ground
+    /// from the mesh until the next bake, and marks the maps for upload again.
+    /// Undoing the write does not raise the alpha, which leaves such ground lit
+    /// from the mesh, correct but less detailed; a save keeps the masked map.
     pub fn normal_map(&self, data_path: &str) -> Option<&ColourMap> {
         self.entries.get(data_path)?.normal_map.as_ref()
     }
 
     /// Records that a terrain's colour map and normal map need uploading.
     fn mark_colour_map_dirty(&self, data_path: &str) {
-        self.colour_map_dirty
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(data_path.to_string());
+        mark_maps_dirty(&self.colour_map_dirty, data_path);
     }
 
-    /// Whether a terrain's colour map and normal map have been replaced since
-    /// this was last called, clearing the mark.
+    /// Whether a terrain's colour map and normal map have been replaced or masked
+    /// since this was last called, clearing the mark.
     ///
     /// The renderer calls this only once it has somewhere to upload to, so maps
     /// that arrive before the material exists keep their mark until then.
@@ -1333,11 +1346,33 @@ impl Drop for ControlGrid<'_> {
 /// to them go nowhere.
 pub struct TerrainEntry<'a> {
     data: &'a mut RegionTerrainData,
+    /// The store's mark that a terrain's maps need uploading again, and the key
+    /// this terrain is marked under, for a height write that masks its normal
+    /// map to set.
+    maps_dirty: &'a Mutex<HashSet<String>>,
+    data_path: String,
 }
 
 impl<'a> TerrainEntry<'a> {
-    fn new(data: &'a mut RegionTerrainData) -> Self {
-        Self { data }
+    fn new(
+        data: &'a mut RegionTerrainData,
+        maps_dirty: &'a Mutex<HashSet<String>>,
+        data_path: &str,
+    ) -> Self {
+        Self {
+            data,
+            maps_dirty,
+            data_path: data_path.to_string(),
+        }
+    }
+
+    /// Lights the ground in `rect` from the mesh from here on, if the terrain
+    /// has a baked normal map ([`mask_baked_normals`]), and marks the maps for
+    /// upload when that changed a texel.
+    fn mask_normals(&mut self, rect: GridRect) {
+        if mask_baked_normals(self.data, rect) {
+            mark_maps_dirty(self.maps_dirty, &self.data_path);
+        }
     }
 
     pub fn heights(&self) -> Cow<'_, [f32]> {
@@ -1364,7 +1399,17 @@ impl<'a> TerrainEntry<'a> {
     /// the terrain has `n` cells a side, so writing one to a terrain holding
     /// no regions allocates the regions to hold it. A smaller grid overwrites
     /// its corner and leaves the rest; nothing here removes ground.
+    ///
+    /// A baked normal map is masked over the cells whose height this changes, and
+    /// one cell around: a write that leaves the ground as it was masks nothing,
+    /// and one that moves the grid's extent masks the whole map.
     pub fn set_heights(&mut self, heights: &[f32]) {
+        // Only a terrain with a normal map pays for knowing what changed.
+        let before = self
+            .data
+            .normal_map
+            .is_some()
+            .then(|| self.heights().into_owned());
         let side = (heights.len() as f64).sqrt().round() as u32;
         if side * side == heights.len() as u32 {
             // Past the cap this allocates nothing and the write lands in
@@ -1375,6 +1420,20 @@ impl<'a> TerrainEntry<'a> {
             Some(region) => region.copy_heights_from(heights),
             None => self.data.set_grid_heights(heights),
         }
+        if let Some(before) = before {
+            let resolution = self.data.grid_resolution();
+            let changed = {
+                let after = self.heights();
+                if after.len() == before.len() {
+                    changed_bounds(&before, &after, resolution as usize)
+                } else {
+                    Some(GridRect::whole(resolution))
+                }
+            };
+            if let Some(rect) = changed {
+                self.mask_normals(rect);
+            }
+        }
     }
 
     /// Overwrites one rectangle of the height grid, row by row.
@@ -1382,6 +1441,10 @@ impl<'a> TerrainEntry<'a> {
     /// `values` is the row-major run [`GridRect::read`] produces for the same
     /// rect. A stroke undo restores through this rather than writing back a
     /// whole terrain to put a few hundred brushed cells back.
+    ///
+    /// A baked normal map is masked over `rect` and one cell around, as a brush
+    /// masks it: putting the old heights back does not put the baked normals back
+    /// with them, so that ground stays lit from the mesh.
     pub fn set_heights_rect(&mut self, rect: GridRect, values: &[f32]) {
         let stride = self.data.grid_resolution();
         match self.data.contiguous_grid_mut() {
@@ -1392,6 +1455,7 @@ impl<'a> TerrainEntry<'a> {
                 self.data.set_grid_heights(&heights);
             }
         }
+        self.mask_normals(rect);
     }
 
     pub fn channels(&self) -> &[jackdaw_terrain::ChannelDescriptor] {
@@ -1482,6 +1546,55 @@ impl<'a> TerrainRead<'a> {
     pub fn document(&self) -> &RegionTerrainData {
         self.data
     }
+}
+
+/// Tells a terrain's baked normal map that the ground in `rect` is not the ground
+/// it was made from any more: the alpha of the texels over `rect`, and one cell
+/// around, goes to 0, and the shader lights that ground from the mesh. `true`
+/// when a texel changed, which is when the maps have to be uploaded again.
+///
+/// Every write to a terrain's heights ends here: the brush, the whole-grid
+/// write and the rect undo restores through.
+fn mask_baked_normals(data: &mut RegionTerrainData, rect: GridRect) -> bool {
+    data.normal_map
+        .as_mut()
+        .is_some_and(|map| map.clear_alpha_over(rect))
+}
+
+/// Records that a terrain's colour map and normal map need uploading.
+fn mark_maps_dirty(dirty: &Mutex<HashSet<String>>, data_path: &str) {
+    dirty
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(data_path.to_string());
+}
+
+/// The smallest rect holding every cell whose height differs between two dense
+/// grids of `stride` cells an edge, or `None` when no cell does.
+fn changed_bounds(before: &[f32], after: &[f32], stride: usize) -> Option<GridRect> {
+    if stride == 0 {
+        return None;
+    }
+    let mut bounds: Option<GridRect> = None;
+    for (z, (was, is)) in before.chunks(stride).zip(after.chunks(stride)).enumerate() {
+        let mut changed = was
+            .iter()
+            .zip(is)
+            .enumerate()
+            .filter_map(|(x, (was, is))| (was != is).then_some(x));
+        let Some(first) = changed.next() else {
+            continue;
+        };
+        let last = changed.next_back().unwrap_or(first);
+        let row = GridRect {
+            x: first as u32,
+            z: z as u32,
+            width: (last - first + 1) as u32,
+            height: 1,
+        };
+        bounds = Some(bounds.map_or(row, |so_far| so_far.union(row)));
+    }
+    bounds
 }
 
 /// Brings a terrain's stored channel values in line with the channel
@@ -2525,5 +2638,154 @@ mod tests {
         assert!(!store.is_load_failed("a.jdterrain"));
         assert_eq!(store.load_failed_reason("a.jdterrain"), None);
         assert!(store.entry_for(&terrain(4, "a.jdterrain")).is_some());
+    }
+
+    /// A store like [`store_for`]'s with a baked normal map of `scale` texels a
+    /// cell, every texel leaning its own way so that a stray write to the colour
+    /// shows. The arrival mark is taken, so a test sees what an edit marks.
+    fn store_with_normal_map(
+        subject: &jackdaw_scene_types::Terrain,
+        scale: u8,
+    ) -> TerrainDataStore {
+        let mut store = store_for(subject);
+        let side = sidecar::side_for(subject.resolution, scale);
+        let texels = (0..side * side)
+            .map(|index| sidecar::normal_texel(Vec3::new(1.0, 1.0 + (index % 7) as f32, 0.0)))
+            .collect();
+        store
+            .document_mut(&subject.data_path)
+            .expect("stored")
+            .normal_map = Some(
+            ColourMap::new(subject.resolution, scale, texels).expect("a map the format holds"),
+        );
+        store.take_colour_map_dirty(&subject.data_path);
+        store
+    }
+
+    /// The coordinates of the texels in a box, row by row.
+    fn block(
+        xs: std::ops::RangeInclusive<u32>,
+        zs: std::ops::RangeInclusive<u32>,
+    ) -> Vec<(u32, u32)> {
+        zs.flat_map(|z| xs.clone().map(move |x| (x, z))).collect()
+    }
+
+    /// The coordinates of the texels whose alpha is 0, row by row, with the
+    /// check that nothing but alpha has been written: every colour is as baked.
+    fn masked_texels(store: &TerrainDataStore, data_path: &str) -> Vec<(u32, u32)> {
+        let map = store.normal_map(data_path).expect("the map is kept");
+        let side = map.side;
+        for (index, texel) in map.texels.iter().enumerate() {
+            // The baked texel's colour, worked out as the fixture made it.
+            let want = sidecar::normal_texel(Vec3::new(1.0, 1.0 + (index % 7) as f32, 0.0));
+            assert_eq!(texel[..3], want[..3], "colour of texel {index}");
+        }
+        map.texels
+            .iter()
+            .enumerate()
+            .filter(|(_, texel)| texel[3] == 0)
+            .map(|(index, _)| (index as u32 % side, index as u32 / side))
+            .collect()
+    }
+
+    /// A baked normal map describes the ground it was made from. A brush stroke
+    /// says which ground it may have changed: the texels over its rect, and one
+    /// cell around, lose their alpha, those and no others, and the maps are
+    /// marked for upload.
+    #[test]
+    fn a_brush_stroke_masks_the_normal_map_over_its_rect_and_one_cell_around() {
+        let subject = terrain(16, "a.jdterrain");
+        let mut store = store_with_normal_map(&subject, 2);
+        assert!(masked_texels(&store, "a.jdterrain").is_empty());
+
+        let rect = GridRect {
+            x: 5,
+            z: 7,
+            width: 3,
+            height: 2,
+        };
+        assert!(store.brush_heights(&subject, rect, |heights| heights[7 * 16 + 5] = 4.0));
+
+        // Cells 4..=8 across and 6..=9 down with the margin; cell `c` spans
+        // texels `2c ..= 2c + 2`.
+        assert_eq!(masked_texels(&store, "a.jdterrain"), block(8..=18, 12..=20));
+        assert!(
+            store.take_colour_map_dirty("a.jdterrain"),
+            "the masked map has to be uploaded again"
+        );
+
+        // The same ground again has no alpha left to take, so nothing to upload.
+        store.brush_heights(&subject, rect, |heights| heights[7 * 16 + 5] = 5.0);
+        assert!(!store.take_colour_map_dirty("a.jdterrain"));
+    }
+
+    /// A whole-grid write is measured against what is stored, so that only the
+    /// cells whose height it changes mask the map: writing the same ground back,
+    /// as a cancelled stroke does with its snapshot, costs the map nothing.
+    #[test]
+    fn a_whole_write_masks_the_normal_map_only_where_a_height_changed() {
+        let subject = terrain(16, "a.jdterrain");
+        let mut store = store_with_normal_map(&subject, 2);
+        let flat = store.heights("a.jdterrain").to_vec();
+
+        // Opening an entry and writing nothing new changes nothing.
+        let _ = store.entry_for(&subject).expect("keyed").heights();
+        store.entry_for(&subject).expect("keyed").set_heights(&flat);
+        assert!(masked_texels(&store, "a.jdterrain").is_empty());
+        assert!(!store.take_colour_map_dirty("a.jdterrain"));
+
+        // Two cells move: the box from (3, 4) to (5, 6) is what changed, and one
+        // cell around it is masked. Cells 2..=6 across and 3..=7 down are texels
+        // 4..=14 and 6..=16.
+        let mut raised = flat.clone();
+        raised[4 * 16 + 3] = 2.0;
+        raised[6 * 16 + 5] = 2.0;
+        store
+            .entry_for(&subject)
+            .expect("keyed")
+            .set_heights(&raised);
+        assert_eq!(masked_texels(&store, "a.jdterrain"), block(4..=14, 6..=16));
+        assert!(store.take_colour_map_dirty("a.jdterrain"));
+    }
+
+    /// Undo puts the old heights back through a rect, and the rect is masked as a
+    /// brush masks it: the baked normals do not come back with the heights, so
+    /// that ground stays lit from the mesh, which is right if less fine.
+    #[test]
+    fn restoring_a_rect_masks_the_normal_map_over_it_too() {
+        let subject = terrain(16, "a.jdterrain");
+        let mut store = store_with_normal_map(&subject, 2);
+        let rect = GridRect {
+            x: 1,
+            z: 1,
+            width: 2,
+            height: 2,
+        };
+
+        store
+            .entry_for(&subject)
+            .expect("keyed")
+            .set_heights_rect(rect, &[1.0; 4]);
+
+        // Cells 0..=3 with the margin: texels 0..=8 both ways.
+        assert_eq!(masked_texels(&store, "a.jdterrain"), block(0..=8, 0..=8));
+        assert!(store.take_colour_map_dirty("a.jdterrain"));
+    }
+
+    /// A terrain with no normal map has nothing to mask and nothing to upload, so
+    /// a stroke on it must not cost the colour map a rebuild.
+    #[test]
+    fn sculpting_a_terrain_without_a_normal_map_marks_nothing_for_upload() {
+        let subject = terrain(16, "a.jdterrain");
+        let mut store = store_for(&subject);
+        store.take_colour_map_dirty("a.jdterrain");
+
+        store.brush_heights(&subject, GridRect::whole(16), |heights| heights[5] = 1.0);
+        store
+            .entry_for(&subject)
+            .expect("keyed")
+            .set_heights(&[2.0; 256]);
+
+        assert!(!store.take_colour_map_dirty("a.jdterrain"));
     }
 }

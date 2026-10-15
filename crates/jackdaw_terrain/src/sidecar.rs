@@ -246,6 +246,12 @@
 //! mesh, so the map can be finer than the grid and carry detail the mesh has
 //! no vertex for.
 //!
+//! Alpha is the weight of the map against the mesh's own normal: 255 is baked
+//! ground, 0 is ground that changed since the bake, which is lit from the mesh,
+//! and in between the two are mixed. A baker writes 255 throughout. The editor
+//! writes 0 over the cells a height edit changed and saves the map so, which
+//! is the only thing in this build that lowers it.
+//!
 //! The writer emits version 13 only for a document that has a normal map. A
 //! document without one is written as version 12, byte for byte as it always
 //! was, so an older build reads it. A version-12 or older file reads back with
@@ -265,6 +271,7 @@ use crate::placement::{
     ScatterAssetError, ScatterGroupError, ScatterPalette, ScatterPaletteEntry, ScatterPlacement,
     validate_scatter_asset, validate_scatter_group,
 };
+use crate::rect::GridRect;
 use crate::region::{Region, RegionCoord, RegionSize, RegionSizeError, TerrainRegions};
 
 /// Magic bytes at the head of every sidecar.
@@ -961,6 +968,47 @@ impl ColourMap {
         }
         Ok(())
     }
+
+    /// Zero the alpha of the texels that lie over the ground in `cells`, grown by
+    /// one cell on every side, and say whether any texel changed. Colour and
+    /// everything outside are left as they are.
+    ///
+    /// This is how an edit to the heights tells a normal map that it no longer
+    /// describes the ground there (alpha 0: light it from the mesh, see
+    /// [`RegionTerrainData::normal_map`]). Texel `scale * i` lies on grid point
+    /// `i`, so grid cell `x` spans texels `scale * x ..= scale * (x + 1)`, and
+    /// `cells` with its margin reaches texels `scale * (x - 1) ..= scale * (x +
+    /// width + 1)` along X, and the same along Z, clamped to the map.
+    pub fn clear_alpha_over(&mut self, cells: GridRect) -> bool {
+        if cells.is_empty() || self.side == 0 {
+            return false;
+        }
+        let (scale, side) = (u32::from(self.scale), self.side);
+        // The texels one axis of `cells` covers, `None` when it lies past the map.
+        let span = |first: u32, count: u32| {
+            let low = scale.saturating_mul(first.saturating_sub(1));
+            let high = scale
+                .saturating_mul(first.saturating_add(count).saturating_add(1))
+                .min(side - 1);
+            (low <= high).then_some((low as usize, high as usize))
+        };
+        let (Some((x0, x1)), Some((z0, z1))) =
+            (span(cells.x, cells.width), span(cells.z, cells.height))
+        else {
+            return false;
+        };
+        let mut changed = false;
+        for z in z0..=z1 {
+            let row = z * side as usize;
+            if let Some(texels) = self.texels.get_mut(row + x0..=row + x1) {
+                for texel in texels {
+                    changed |= texel[3] != 0;
+                    texel[3] = 0;
+                }
+            }
+        }
+        changed
+    }
 }
 
 /// How a terrain textures the cells no hand has claimed. Off until a terrain
@@ -1493,7 +1541,18 @@ pub struct RegionTerrainData {
     /// map, so [`ColourMap::new`] with the terrain's grid resolution works the
     /// side out.
     ///
-    /// Carried across edits like [`Self::colour_map`].
+    /// A texel's alpha is how far the map is to be believed there. 255 is baked
+    /// ground. 0 says the ground here changed since the bake, so it is lit from
+    /// the mesh instead; in between the shader mixes the two normals, which is
+    /// what filtering leaves at the edge of such ground. A baker writes 255
+    /// throughout.
+    ///
+    /// The map follows the regions' paint untouched, but not their heights: an
+    /// edit to the heights zeroes the alpha of the texels over the cells it
+    /// changed ([`ColourMap::clear_alpha_over`]), and a save writes the map as
+    /// it then stands. Nothing raises the alpha again, not even an undo, until
+    /// the terrain is baked anew. Whoever rebuilds a document from another
+    /// carries the map across as it is, like [`Self::colour_map`].
     pub normal_map: Option<ColourMap>,
     /// Where this document's cells sit in the world, or `None` when the file it
     /// came from is too old to state it.
@@ -4684,6 +4743,82 @@ mod tests {
             Vec3::splat(f32::INFINITY),
         ] {
             assert_eq!(normal_texel(unusable), UP_NORMAL_TEXEL, "{unusable}");
+        }
+    }
+
+    /// Grid cell `x` spans texels `scale * x ..= scale * (x + 1)`, and an edit
+    /// reaches one cell beyond the cells it changed, so the alpha that goes is
+    /// that block's and nothing else's, clamped to the map; the colour stays.
+    #[test]
+    fn clearing_the_alpha_over_some_cells_zeroes_their_texels_and_one_cell_around() {
+        use bevy_math::Vec3;
+
+        // Six grid points a side at two texels a cell: eleven texels a side.
+        let baked = ColourMap::new(
+            6,
+            2,
+            (0..121u8)
+                .map(|i| normal_texel(Vec3::new(f32::from(i % 7), 9.0, f32::from(i % 5))))
+                .collect(),
+        )
+        .expect("a map the format holds");
+
+        // (cells x, z, width, height) and the texels they must reach, inclusive.
+        for (cells, x_texels, z_texels) in [
+            // Cells 2 and 3 across, 3 down: with the margin cells 1..=4 across and
+            // 2..=4 down, which is texels 2..=10 and 4..=10 (cell 4 ends at 10).
+            ((2, 3, 2, 1), 2..=10, 4..=10),
+            // A corner: no cell before the first, so the margin runs one way.
+            ((0, 0, 1, 1), 0..=4, 0..=4),
+            // The far corner, clamped to the last texel.
+            ((5, 5, 1, 1), 8..=10, 8..=10),
+            // The whole grid.
+            ((0, 0, 6, 6), 0..=10, 0..=10),
+        ] {
+            let (x, z, width, height) = cells;
+            let mut map = baked.clone();
+            assert!(map.clear_alpha_over(GridRect {
+                x,
+                z,
+                width,
+                height
+            }));
+            for (index, (now, was)) in map.texels.iter().zip(&baked.texels).enumerate() {
+                let (tx, tz) = (index as u32 % 11, index as u32 / 11);
+                let inside = x_texels.contains(&tx) && z_texels.contains(&tz);
+                let want = if inside { 0 } else { 255 };
+                assert_eq!(now[3], want, "texel ({tx}, {tz}) of {cells:?}");
+                assert_eq!(now[..3], was[..3], "colour of texel ({tx}, {tz})");
+            }
+            assert!(
+                !map.clear_alpha_over(GridRect {
+                    x,
+                    z,
+                    width,
+                    height
+                }),
+                "nothing is left to clear the second time"
+            );
+        }
+
+        // Past the map, or no cells at all: nothing to clear.
+        for cells in [
+            GridRect {
+                x: 40,
+                z: 0,
+                width: 1,
+                height: 1,
+            },
+            GridRect {
+                x: 1,
+                z: 1,
+                width: 0,
+                height: 3,
+            },
+        ] {
+            let mut map = baked.clone();
+            assert!(!map.clear_alpha_over(cells), "{cells:?}");
+            assert_eq!(map, baked);
         }
     }
 

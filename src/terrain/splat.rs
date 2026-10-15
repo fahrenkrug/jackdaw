@@ -504,11 +504,12 @@ fn refresh_surface(
 
 /// Follow a terrain's colour map and normal map into the material it draws with.
 ///
-/// The maps arrive with their document and are never edited in place, so the
-/// store only says that they were replaced, once for both. The images are
-/// rebuilt whole and the material pointed at them, which is also what makes the
-/// bind group pick them up. An entry with no material yet is left alone, and
-/// keeps the mark, so the maps reach it through `build_ready_materials`.
+/// The maps arrive with their document, and the store says when they were
+/// replaced, or when a sculpt masked the normal map over the ground it changed,
+/// once for both. The images are rebuilt whole from the document and the
+/// material pointed at them, which is also what makes the bind group pick them
+/// up. An entry with no material yet is left alone, and keeps the mark, so the
+/// maps reach it through `build_ready_materials`.
 fn refresh_colour_maps(
     materials: Res<TerrainSplatMaterials>,
     mut splat_materials: ResMut<Assets<TerrainSplatMaterial>>,

@@ -173,6 +173,10 @@ pub(super) fn normal_to_world(local_from_world: Mat4) -> Mat3 {
 /// stands for. The texel stores the terrain-space normal as `(x, z, y)`, linear
 /// bytes; `geometric` is the mesh's normal, which stands in for a texel that
 /// points nowhere.
+///
+/// The texel's alpha weighs the map against the mesh: 255 is the map's normal, 0
+/// is `geometric`, and in between the two are mixed in world space and
+/// normalized again.
 pub(super) fn baked_normal(texel: [u8; 4], normal_to_world: Mat3, geometric: Vec3) -> Vec3 {
     let stored = Vec3::new(
         f32::from(texel[0]),
@@ -185,7 +189,12 @@ pub(super) fn baked_normal(texel: [u8; 4], normal_to_world: Mat3, geometric: Vec
     if local.length_squared() < NORMAL_MAP_MIN_LENGTH_SQ {
         return geometric;
     }
-    (normal_to_world * local).normalize()
+    let baked = (normal_to_world * local).normalize();
+    let mixed = geometric.lerp(baked, f32::from(texel[3]) / 255.0);
+    if mixed.length_squared() < NORMAL_MAP_MIN_LENGTH_SQ {
+        return geometric;
+    }
+    mixed.normalize()
 }
 
 /// One texture id as the shader reads it at a fragment: the share of each of the
@@ -733,6 +742,43 @@ mod tests {
         // Up is a direction, and the mesh's normal has no say in it.
         let up = baked_normal([128, 128, 255, 255], Mat3::IDENTITY, geometric);
         assert!(up.abs_diff_eq(Vec3::Y, 0.01), "{up}");
+    }
+
+    /// A texel's alpha is how far the map is believed. The editor zeroes it over
+    /// ground sculpted after the bake: alpha 0 is the mesh's normal, alpha 255 the
+    /// map's, and between them a normalized mix, which is what the mips and the
+    /// bilinear filter leave at the edge of such ground.
+    #[test]
+    fn a_texels_alpha_weighs_the_map_against_the_mesh() {
+        use crate::sidecar::normal_texel;
+
+        let geometric = Vec3::new(0.0, 0.6, 0.8);
+        let map = Vec3::new(0.6, 0.8, 0.0);
+        let [r, g, b, _] = normal_texel(map);
+        let read = |alpha: u8| baked_normal([r, g, b, alpha], Mat3::IDENTITY, geometric);
+
+        assert!(read(0).abs_diff_eq(geometric, 1e-6), "{}", read(0));
+        let believed = read(255);
+        assert!(believed.abs_diff_eq(map, 0.01), "{believed}");
+
+        // Half the weight: the mix of the two unit normals, normalized again,
+        // which is shorter before it is normalized and so leans no further than
+        // either of them does.
+        let weight = 128.0 / 255.0;
+        let half = read(128);
+        let want = (geometric * (1.0 - weight) + believed * weight).normalize();
+        assert!((half.length() - 1.0).abs() < 1e-5, "{half}");
+        assert!(half.abs_diff_eq(want, 1e-5), "{half} against {want}");
+        assert!(
+            half.dot(geometric) > geometric.dot(believed)
+                && half.dot(believed) > geometric.dot(believed),
+            "{half} lies between {geometric} and {believed}"
+        );
+
+        // Opposite normals at half weight cancel: the mesh's stands in, and
+        // there is no NaN to light with.
+        let cancelled = baked_normal([128, 128, 255, 128], Mat3::IDENTITY, -Vec3::Y);
+        assert_eq!(cancelled, -Vec3::Y);
     }
 
     /// Every word draws at least one layer, or a fragment would normalise zero

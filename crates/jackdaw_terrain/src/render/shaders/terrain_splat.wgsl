@@ -48,7 +48,8 @@
 //   TERRAIN_COLOUR_MAP  a colour map: its sample, and the mix of it with the
 //                       texture's own colour
 //   TERRAIN_NORMAL_MAP  a normal map: the surface is lit from it per pixel
-//                       rather than from the mesh's normal
+//                       rather than from the mesh's normal, as far as each
+//                       texel's alpha says the map still holds
 //   TERRAIN_DOMINANT    either of the first two: the choice of the texture they
 //                       are made from
 //
@@ -779,12 +780,19 @@ fn relief_travel(
 
 #ifdef TERRAIN_NORMAL_MAP
 // A normal read back shorter than this points nowhere: texels leaning opposite
-// ways, filtered to the middle of a fold.
+// ways, filtered to the middle of a fold. The mix of the map's normal with the
+// mesh's, below, is held to the same floor.
 const NORMAL_MAP_MIN_LENGTH_SQ: f32 = 1e-4;
 
 // The terrain's own normal under a fragment, in world space, read from the baked
 // normal map. `geometric` is the mesh's normal, which stands in where the map
 // says nothing.
+//
+// A texel's alpha is how far the map is to be believed there. 255 is a texel
+// that was baked; 0 is ground that was sculpted after the bake, which the map no
+// longer describes, so it is lit from the mesh. In between the two normals are
+// mixed and normalized again, which is what the mips and the bilinear filter
+// leave at the edge of such a region: it fades rather than cuts.
 //
 // The map is laid out like the colour map, over its own finer grid: texel
 // `scale * i` sits on grid point `i`. UV0 puts grid point `i` at `i / (res - 1)`
@@ -808,12 +816,19 @@ fn baked_normal(
 ) -> vec3<f32> {
     let side = f32(max(splat.normal_map_side, 2u));
     let texel_uv = (uv * (side - 1.0) + 0.5) / side;
-    let stored = textureSample(normal_map, colour_map_sampler, texel_uv).rgb * 2.0 - 1.0;
+    let texel = textureSample(normal_map, colour_map_sampler, texel_uv);
+    let stored = texel.rgb * 2.0 - 1.0;
     let local = vec3<f32>(stored.x, stored.z, stored.y);
     if dot(local, local) < NORMAL_MAP_MIN_LENGTH_SQ {
         return geometric;
     }
-    return normalize(normal_to_world * local);
+    // Both normals are in world space here, where the mix is taken. Opposite
+    // normals at half weight cancel; the mesh's stands in for them.
+    let mixed = mix(geometric, normalize(normal_to_world * local), texel.a);
+    if dot(mixed, mixed) < NORMAL_MAP_MIN_LENGTH_SQ {
+        return geometric;
+    }
+    return normalize(mixed);
 }
 #endif
 
@@ -904,14 +919,19 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #else
     let n = geometric;
 #endif
-    // The mesher emits no tangents: UV0 runs along world X and Z, so the tangent
-    // is world +X projected onto the surface normal. That projection collapses
-    // where the surface stands vertical and faces X, so +Z stands in there.
-    // Picking the axis the normal leans on least would swap the frame by 90
-    // degrees wherever |n.x| and |n.z| cross, seaming flat ground.
-    var reference = vec3<f32>(1.0, 0.0, 0.0);
-    if abs(n.x) > 0.999 {
-        reference = vec3<f32>(0.0, 0.0, 1.0);
+    // The mesher emits no tangents: UV0, and the texture coordinates the top plane
+    // takes from it, run along the terrain's own X and Z, which a turned terrain
+    // carries off the world's. So the tangent is the terrain's +X, in world
+    // space, projected onto the surface normal. That projection collapses where
+    // the surface stands vertical and faces along that axis, so the terrain's +Z
+    // stands in there. Picking the axis the normal leans on least would swap the
+    // frame by 90 degrees wherever its lean along each crosses, seaming flat
+    // ground. For a terrain that is not turned these are the world's X and Z.
+    let world_from_local = get_world_from_local(in.instance_index);
+    let local_x = normalize(world_from_local[0].xyz);
+    var reference = local_x;
+    if abs(dot(n, local_x)) > 0.999 {
+        reference = normalize(world_from_local[2].xyz);
     }
     let t = normalize(reference - n * dot(reference, n));
     let b = cross(t, n);
@@ -921,7 +941,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // terrain's Y, so the normal is taken into terrain space first: with
     // `world_from_local` transposed, where `normal_to_world` above is
     // `local_from_world` transposed.
-    let world_from_local = get_world_from_local(in.instance_index);
     let to_local = transpose(mat3x3<f32>(
         world_from_local[0].xyz, world_from_local[1].xyz, world_from_local[2].xyz));
     let local_normal = normalize(to_local * n);

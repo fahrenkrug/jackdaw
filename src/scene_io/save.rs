@@ -2040,6 +2040,11 @@ mod terrain_sidecar_tests {
     /// colour are authored in the same file. Editing the ground and saving must
     /// keep every one of them, and a reopened editor must mark the maps for
     /// upload, or they never reach the material.
+    ///
+    /// The normal map is the one that follows the ground: the texels over the
+    /// cell the edit raised, and one cell around, are saved with their alpha at 0
+    /// so a reload lights that ground from the mesh, and every other texel is
+    /// saved as it was baked.
     #[test]
     fn the_colour_map_the_normal_map_and_the_dials_survive_an_edit_a_save_and_a_reload() {
         use jackdaw_terrain::Control;
@@ -2084,17 +2089,38 @@ mod terrain_sidecar_tests {
                 )
                 .expect("plain material names are accepted");
             store.set_surface(data_path, surface).expect("a keyed path");
-            let document = store.document_mut(data_path).expect("authored");
-            document.colour_map = Some(map.clone());
-            document.normal_map = Some(normals.clone());
-
-            // The ground is edited after the bake, by the same views a brush uses.
+            // The ground is sculpted, and then baked: the maps arrive with it.
             store
                 .entry_for(&terrain)
                 .expect("keyed")
                 .set_heights(&sculpted().heights);
+            let document = store.document_mut(data_path).expect("authored");
+            document.colour_map = Some(map.clone());
+            document.normal_map = Some(normals.clone());
+
+            // The ground is edited after the bake, by the same views a brush
+            // uses: the far corner cell is raised.
+            let corner = jackdaw_terrain::GridRect {
+                x: 3,
+                z: 3,
+                width: 1,
+                height: 1,
+            };
+            store.brush_heights(&terrain, corner, |heights| heights[15] += 1.0);
             store.control_mut(&terrain).expect("keyed")[5] = Control::default().with_base_id(1);
         }
+
+        // Grid point 3 is the last one, at texel 6 of 0..=6 (two texels a cell),
+        // and with one cell around it the texels from 2 * (3 - 1) = 4 to the end
+        // of the map, each way, are the far corner.
+        let mut masked = normals.clone();
+        for z in 4..7 {
+            for x in 4..7 {
+                masked.texels[z * 7 + x][3] = 0;
+            }
+        }
+        let mut raised = sculpted().heights;
+        raised[15] += 1.0;
 
         export_terrain_sidecars(&mut world, &scene_path.to_string_lossy()).expect("save succeeds");
         let written = std::fs::read(tmp.join(data_path)).expect("the sidecar is written");
@@ -2115,10 +2141,10 @@ mod terrain_sidecar_tests {
 
         let store = reopened.resource::<TerrainDataStore>();
         assert_eq!(store.colour_map(data_path), Some(&map));
-        assert_eq!(store.normal_map(data_path), Some(&normals));
+        assert_eq!(store.normal_map(data_path), Some(&masked));
         assert_eq!(store.surface(data_path), surface);
         assert_eq!(store.materials(data_path)[0].texture_colour, 0.25);
-        assert_eq!(store.heights(data_path), sculpted().heights.as_slice());
+        assert_eq!(store.heights(data_path), raised.as_slice());
         assert!(
             store.take_colour_map_dirty(data_path),
             "loaded maps must be marked for upload, or they never reach the material",

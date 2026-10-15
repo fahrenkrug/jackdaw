@@ -994,9 +994,13 @@ pub fn colour_map_image(map: Option<&ColourMap>) -> Image {
 /// Linear, because the bytes are directions and not colours. The chain averages
 /// each four texels as directions and renormalizes them, as the layer normal
 /// arrays' does, so a distant texel is the direction of the ground it stands for
-/// and not a shorter vector. Filtered, clamped to the edge and anisotropic: the
-/// shader reads it with the colour map's sampler, which is built from
-/// [`colour_map_image`]'s, and this one is the same so the two cannot disagree.
+/// and not a shorter vector. Alpha is the weight of the map against the mesh's
+/// normal (the editor zeroes it over ground sculpted after the bake) and
+/// averages as a plain share, so such ground fades out with distance and does
+/// not keep the map at full weight in the mips. Filtered, clamped to the edge and
+/// anisotropic: the shader reads it with the colour map's sampler, which is built
+/// from [`colour_map_image`]'s, and this one is the same so the two cannot
+/// disagree.
 ///
 /// A map that fails [`ColourMap::validate`] builds the straight-up texel rather
 /// than reading past the texels it has.
@@ -3502,6 +3506,31 @@ mod tests {
         for (got, want) in one_texel.iter().zip(UP_NORMAL_TEXEL) {
             assert!(got.abs_diff(want) <= 1, "{one_texel:?} against straight up");
         }
+    }
+
+    /// The alpha of a normal map texel is how far the map is believed, and a
+    /// mip's is the share of its ground that is still baked: two texels masked
+    /// by the editor out of four are half the weight at the one-texel mip, not
+    /// the full weight of the two that were not.
+    #[test]
+    fn the_normal_map_mips_average_the_alpha_as_the_share_still_baked() {
+        let [r, g, b, _] = UP_NORMAL_TEXEL;
+        let map = ColourMap::new(
+            2,
+            1,
+            vec![UP_NORMAL_TEXEL, [r, g, b, 0], UP_NORMAL_TEXEL, [r, g, b, 0]],
+        )
+        .expect("2 by 2");
+
+        let image = normal_map_image(Some(&map));
+
+        let data = image.data.as_ref().expect("built images carry data");
+        assert_eq!(&data[4..8], &[r, g, b, 0], "the base level keeps its mask");
+        assert!(
+            data[19].abs_diff(128) <= 1,
+            "the one-texel mip is half baked: {:?}",
+            &data[16..20]
+        );
     }
 
     /// No normal map is one straight-up texel, and so is one the format could not

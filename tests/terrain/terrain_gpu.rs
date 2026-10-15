@@ -407,6 +407,9 @@ enum NormalMap {
     CreaseX,
     /// The same along X, the half before it leaning toward +Z.
     CreaseZ,
+    /// `CreaseX` with this alpha on every texel: how far the map is believed.
+    /// 0 is what the editor leaves over ground sculpted after the bake.
+    Faded(u8),
 }
 
 impl NormalMap {
@@ -419,11 +422,15 @@ impl NormalMap {
         let texels = (0..side * side)
             .map(|index| {
                 let (x, z) = (index % side, index / side);
-                normal_texel(match self {
+                let mut texel = normal_texel(match self {
                     Self::Up => Vec3::Y,
-                    Self::CreaseX => Vec3::new(lean(x), 1.0, 0.0),
+                    Self::CreaseX | Self::Faded(_) => Vec3::new(lean(x), 1.0, 0.0),
                     Self::CreaseZ => Vec3::new(0.0, 1.0, lean(z)),
-                })
+                });
+                if let Self::Faded(alpha) = self {
+                    texel[3] = alpha;
+                }
+                texel
             })
             .collect();
         ColourMap::new(RESOLUTION, NORMAL_SCALE, texels).expect("a map the format holds")
@@ -888,6 +895,32 @@ fn the_splat_shader_renders_on_a_gpu() {
             ..bumpy.clone()
         },
     );
+    // The textures' normals lean along the terrain's own U, whichever way the
+    // terrain faces: turned about Y, seen by a camera and lit by a light turned
+    // with it, the plate is the same picture. A tangent taken from the world's X
+    // would lean every bump by the turn.
+    let turned_bumps = gpu.shoot(
+        "bumps_near_turned",
+        &Spec {
+            placement: Transform::from_rotation(turn),
+            eye: looking(
+                turn * Vec3::new(0.0, 4.0, 0.01),
+                Vec3::ZERO,
+                turn * Vec3::NEG_Z,
+            ),
+            light: bumpy.light.map(|shining| turn * shining),
+            surface: SurfaceSettings {
+                far_distance: 0.0,
+                ..SurfaceSettings::default()
+            },
+            ..bumpy.clone()
+        },
+    );
+    assert!(
+        with_maps.difference(&turned_bumps) < 0.02,
+        "a turned terrain lights its textures' normals the same: {}",
+        with_maps.difference(&turned_bumps)
+    );
     let without = gpu.shoot(
         "bumps_far",
         &Spec {
@@ -986,6 +1019,40 @@ fn the_splat_shader_renders_on_a_gpu() {
         straight_up.max_byte_difference(&by_mesh) <= 1,
         "a normal map that is straight up changed the picture by {}/255",
         straight_up.max_byte_difference(&by_mesh)
+    );
+
+    // A texel's alpha is how far the map is believed, and the editor zeroes it
+    // over ground sculpted after the bake. A crease masked everywhere lights the
+    // plate from the mesh alone, to the last byte; at half weight the bright half
+    // is lit between the mesh's flat ground and the full crease.
+    let masked = gpu.shoot(
+        "normal_map_masked",
+        &Spec {
+            normal_map: Some(NormalMap::Faded(0)),
+            ..creased.clone()
+        },
+    );
+    assert!(
+        masked.max_byte_difference(&by_mesh) <= 1,
+        "a crease masked everywhere changed the picture by {}/255",
+        masked.max_byte_difference(&by_mesh)
+    );
+    let half = gpu.shoot(
+        "normal_map_half",
+        &Spec {
+            normal_map: Some(NormalMap::Faded(128)),
+            ..creased.clone()
+        },
+    );
+    let (flat_half, mixed_half, creased_half) = (
+        luminance(by_mesh.mean((16, 40), (56, 88))),
+        luminance(half.mean((16, 40), (56, 88))),
+        luminance(folded.mean((16, 40), (56, 88))),
+    );
+    assert!(
+        flat_half < mixed_half && mixed_half < creased_half,
+        "half the crease lights the half that faces the light between flat and creased: \
+         {flat_half}, {mixed_half}, {creased_half}"
     );
 
     // The map is in the terrain's own axes: a terrain turned about Y, seen by a

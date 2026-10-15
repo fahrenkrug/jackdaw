@@ -219,6 +219,8 @@ levels light evenly. The map can be finer than the grid, built
 from a finer heightfield than the mesh has, and the textures'
 own normal maps are laid over it as before. It is compiled into
 the shader like the others, only for a terrain that has one.
+Where you sculpt a baked terrain, the editor lights the changed
+ground from the mesh until the next bake.
 
 ## Autoterrain
 
