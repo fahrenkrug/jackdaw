@@ -1035,6 +1035,9 @@ fn map_sampler() -> ImageSamplerDescriptor {
 /// `scale * i` lies on that point and is centred at `(scale*i + 0.5)/side`. For
 /// a scale of 1 the side is the control resolution and this is [`tint_uv`] on
 /// each axis.
+///
+/// The normal map is laid out the same way over its own side, so this is where
+/// its texels are read too (`baked_normal` in the shader).
 #[must_use]
 pub fn colour_map_uv(uv: Vec2, side: u32) -> Vec2 {
     let side = side.max(2) as f32;
